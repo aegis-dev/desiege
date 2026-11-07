@@ -1,0 +1,26 @@
+[package]
+name = "desiege"
+version = "0.1.0"
+edition = "2021"
+
+# Build for the game (32-bit), or just run build.ps1:
+#   cargo build -p desiege --release --target i686-pc-windows-msvc --lib --bins
+# Output: target/i686-pc-windows-msvc/release/{desiege.dll, desiege-loader.exe}
+
+[lib]
+name = "desiege"
+crate-type = ["cdylib"]
+
+[dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }

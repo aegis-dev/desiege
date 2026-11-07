@@ -1,0 +1,10 @@
+[workspace]
+members = ["launcher", "crates/desiege", "crates/ddraw-stub", "crates/tank"]
+resolver = "2"
+
+# Unwinding a Rust panic into game/C code is UB; abort instead.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

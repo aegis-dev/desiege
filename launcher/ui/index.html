@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Desiege</title>
+  <style>
+    :root { --bg: #1a1410; --panel: #2a201a; --gold: #d4af37; --text: #eadfc8; --muted: #9c8f78; --err: #e06c5a; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 24px; background: var(--bg); color: var(--text); font: 14px/1.4 Georgia, serif; }
+    h1 { margin: 0 0 20px; color: var(--gold); font-size: 26px; letter-spacing: 2px; text-align: center; }
+    fieldset { border: 1px solid #4a3a2c; background: var(--panel); border-radius: 6px; padding: 14px; margin: 0 0 16px; }
+    legend { color: var(--gold); padding: 0 6px; }
+    label { display: block; margin-bottom: 10px; }
+    select { display: block; margin-top: 4px; padding: 6px 8px; background: #120e0b; color: var(--text); border: 1px solid #4a3a2c; border-radius: 4px; font: inherit; }
+    input[type=text], input[type=number] { width: 100%; padding: 6px 8px; background: #120e0b; color: var(--text); border: 1px solid #4a3a2c; border-radius: 4px; font: inherit; }
+    input:focus-visible, button:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+    .row { display: flex; gap: 8px; align-items: end; }
+    .row label { flex: 1; margin: 0; }
+    button { padding: 7px 12px; background: #3a2c20; color: var(--text); border: 1px solid var(--gold); border-radius: 4px; font: inherit; cursor: pointer; }
+    button:hover { background: #4a3a2a; }
+    #play { width: 100%; padding: 12px; font-size: 18px; letter-spacing: 3px; background: #6e1414; }
+    #play:hover { background: #8a1c1c; }
+    .hint { color: var(--muted); font-size: 12px; }
+    #status { min-height: 20px; margin-top: 10px; text-align: center; color: var(--muted); }
+    #status.err { color: var(--err); }
+    #consent { position: fixed; inset: 0; background: rgba(10, 8, 6, .92); padding: 24px; overflow-y: auto; }
+    #consent[hidden] { display: none; }
+    #consent .box { background: var(--panel); border: 1px solid var(--gold); border-radius: 6px; padding: 16px; }
+    #consent h2 { margin: 0 0 10px; color: var(--gold); font-size: 18px; }
+    #consent p { margin: 0 0 10px; }
+    #consent ul { margin: 0 0 10px; padding-left: 20px; }
+    #consent a { color: var(--gold); }
+    #consent .muted { color: var(--muted); font-size: 12px; word-break: break-all; }
+    #consent .row { justify-content: flex-end; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <h1>DUNGEON SIEGE</h1>
+  <fieldset>
+    <legend>Game folder</legend>
+    <input id="dir" type="text" aria-label="Game folder" spellcheck="false">
+  </fieldset>
+  <fieldset>
+    <legend>Display</legend>
+    <div class="row">
+      <label>Width <input id="w" type="number" min="320" max="16384"></label>
+      <label>Height <input id="h" type="number" min="240" max="16384"></label>
+      <button id="native" type="button">Native</button>
+    </div>
+    <label style="margin-top:12px">Display mode
+      <select id="display">
+        <option value="exclusive">Fullscreen (exclusive)</option>
+        <option value="borderless">Borderless window</option>
+        <option value="windowed">Windowed</option>
+      </select>
+      <span class="hint">borderless: instant Alt-Tab, the monitor never changes mode</span>
+    </label>
+    <label>UI scale
+      <select id="scale">
+        <option value="1">Off (original size)</option>
+        <option value="1.25">125%</option>
+        <option value="1.5">150%</option>
+        <option value="1.75">175%</option>
+        <option value="2">200%</option>
+      </select>
+      <span class="hint">fullscreen or borderless; game runs at display ÷ scale, 3D stays sharp</span>
+    </label>
+    <label>Shadow quality
+      <select id="shadows">
+        <option value="64">Low (64 px)</option>
+        <option value="128">Normal (128 px)</option>
+        <option value="256">High (256 px)</option>
+        <option value="512">Ultra (512 px)</option>
+        <option value="0">Original method (slow, for troubleshooting)</option>
+      </select>
+      <span class="hint">character shadows rendered on the GPU; higher = sharper</span>
+    </label>
+  </fieldset>
+  <fieldset>
+    <legend>Launch method</legend>
+    <label><input type="radio" name="method" value="inject"> Inject <span class="hint">(game folder untouched)</span></label>
+    <label><input type="radio" name="method" value="game_folder"> ddraw.dll in game folder <span class="hint">(also works from Steam)</span></label>
+  </fieldset>
+  <button id="play" type="button">PLAY</button>
+  <div id="status" role="status"></div>
+
+  <div id="consent" hidden role="dialog" aria-modal="true" aria-labelledby="consent-title">
+    <div class="box">
+      <h2 id="consent-title">Download renderer fix?</h2>
+      <p>Windows' built-in Direct3D 7 can't render wider than 2048 pixels, so the game crashes at your
+        native resolution. <b>dxwrapper</b> translates the game's Direct3D 7 to Direct3D 9 and fixes that.</p>
+      <p>It's a third-party open-source project (zlib license, ~10 MB). It goes into the launcher's
+        data folder; no game files are changed.</p>
+      <ul>
+        <li><a href="#" data-link="0">Source code</a></li>
+        <li><a href="#" data-link="1">This release</a></li>
+        <li><a href="#" data-link="2">License</a></li>
+      </ul>
+      <p class="muted">The download is checked against a pinned SHA-256 before anything is installed.</p>
+      <div class="row">
+        <button id="skip" type="button">Not now</button>
+        <button id="download" type="button">Download</button>
+      </div>
+    </div>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

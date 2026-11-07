@@ -1,0 +1,11 @@
+[package]
+name = "tank"
+version = "0.1.0"
+edition = "2021"
+
+# Reader for Dungeon Siege Tank archives (.dsres / .dsmap), plus a small CLI:
+#   cargo run -p tank --release -- list <file.dsres>
+#   cargo run -p tank --release -- cat <file.dsres> <path/in/archive>
+
+[dependencies]
+miniz_oxide = "0.8"

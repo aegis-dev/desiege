@@ -1,0 +1,14 @@
+[package]
+name = "ddraw-stub"
+version = "0.1.0"
+edition = "2021"
+
+# Tiny ddraw.dll for the game folder ("ddraw.dll in game folder" launch method).
+# 32-bit: cargo build -p ddraw-stub --release --target i686-pc-windows-msvc (or build.ps1)
+
+[lib]
+name = "ddraw"
+crate-type = ["cdylib"]
+
+[dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_LibraryLoader", "Win32_System_SystemInformation"] }
