@@ -146,7 +146,7 @@ and between the game and a handful of Windows APIs. The main pieces:
   frame. Desiege redirects that drawing into a video-memory render target of the selected size and
   substitutes it whenever the game binds the shadow texture.
 - **Dynamic vertex buffers.** The game streams most geometry through a ring buffer using the
-  correct “no overwrite” locking pattern, but the translation layer dropped that hint and
+  correct “no overwrite” locking pattern, but the dxwrapper translation layer dropped that hint and
   re-uploaded the whole buffer with a sync on every append. Desiege mirrors those buffers in system
   memory and issues draw-from-memory calls covering only the vertices used.
 - **Borderless.** dxwrapper's `FullscreenWindowMode` turns exclusive fullscreen into a borderless
