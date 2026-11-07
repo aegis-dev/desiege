@@ -566,71 +566,12 @@ unsafe extern "system" fn sf_flip(this: P, target: P, flags: u32) -> HRESULT {
     let dev = DEVICE.load(Relaxed);
     if dev != 0 {
         cursor::draw(dev as P);
-        if experiment("whitehunt") {
-            white_hunt(dev as P);
-        }
     }
     let frame = SNAP_FRAME.swap(usize::MAX, Relaxed);
     if dev != 0 && frame != usize::MAX {
         maybe_snapshot(dev as P, frame);
     }
     call!(SF_FLIP as fn(P, P, u32) -> HRESULT; this, target, flags)
-}
-
-/// Where the cursor quad was last drawn (native px), for white_hunt.
-pub static LAST_CURSOR: Mutex<Option<RECT>> = Mutex::new(None);
-
-/// Debug (DESIEGE_EXPERIMENT=whitehunt): read back every finished frame and dump the first few
-/// that are mostly white, or whose cursor area is, to %LOCALAPPDATA%\Desiege\white_<n>.bmp.
-/// Slow (a full read-back per frame); only for hunting one-frame flashes.
-unsafe fn white_hunt(dev: P) {
-    static DUMPED: AtomicUsize = AtomicUsize::new(0);
-    static FRAME: AtomicUsize = AtomicUsize::new(0);
-    let frame = FRAME.fetch_add(1, Relaxed);
-    if DUMPED.load(Relaxed) >= 4 {
-        return;
-    }
-    let get_rt: unsafe extern "system" fn(P, *mut P) -> HRESULT = std::mem::transmute(*(*(dev as *const *const usize)).add(9));
-    let mut rt = std::ptr::null_mut();
-    if get_rt(dev, &mut rt) < 0 || rt.is_null() {
-        return;
-    }
-    let mut d = [0u32; 31];
-    d[0] = 124;
-    if call!(SF_LOCK as fn(P, *mut RECT, *mut c_void, u32, P) -> HRESULT; rt, std::ptr::null_mut(), d.as_mut_ptr().cast(), 1 | 0x10, std::ptr::null_mut()) >= 0 {
-        let (h, w, pitch, bits) = (d[2] as usize, d[3] as usize, d[4] as usize, d[9] as *const u8);
-        let px = |x: usize, y: usize| *(bits.add(y.min(h - 1) * pitch) as *const u32).add(x.min(w - 1));
-        let white = |c: u32| (c & 0xFF) > 235 && ((c >> 8) & 0xFF) > 235 && ((c >> 16) & 0xFF) > 235;
-        let (mut n, mut wn) = (0, 0);
-        for y in (8..h).step_by(32) { for x in (8..w).step_by(32) { n += 1; if white(px(x, y)) { wn += 1 } } }
-        let screen = wn as f32 / n.max(1) as f32;
-        let mut cur = 0.0;
-        if let Some(r) = LAST_CURSOR.lock().ok().and_then(|l| *l) {
-            let (mut cn, mut cw) = (0, 0);
-            for y in (r.top.max(0) as usize..r.bottom.max(0) as usize).step_by(4) {
-                for x in (r.left.max(0) as usize..r.right.max(0) as usize).step_by(4) { cn += 1; if white(px(x, y)) { cw += 1 } }
-            }
-            cur = cw as f32 / cn.max(1) as f32;
-        }
-        if screen > 0.4 || cur > 0.5 {
-            let k = DUMPED.fetch_add(1, Relaxed);
-            let mut bmp = Vec::with_capacity(54 + w * h * 4);
-            bmp.extend_from_slice(b"BM");
-            for v in [(54 + w * h * 4) as u32, 0, 54, 40, w as u32, (-(h as i32)) as u32] { bmp.extend_from_slice(&v.to_le_bytes()); }
-            bmp.extend_from_slice(&1u16.to_le_bytes());
-            bmp.extend_from_slice(&32u16.to_le_bytes());
-            for _ in 0..6 { bmp.extend_from_slice(&0u32.to_le_bytes()); }
-            for y in 0..h { bmp.extend_from_slice(std::slice::from_raw_parts(bits.add(y * pitch), w * 4)); }
-            if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
-                let _ = std::fs::write(std::path::PathBuf::from(dir).join("Desiege").join(format!("white_{k}.bmp")), &bmp);
-            }
-            log!("whitehunt: frame {frame} screen white {:.0}% cursor area white {:.0}% (cursor rect {:?}) -> white_{k}.bmp",
-                screen * 100.0, cur * 100.0, LAST_CURSOR.lock().ok().and_then(|l| *l).map(|r| (r.left, r.top, r.right, r.bottom)));
-        }
-        call!(SF_UNLOCK as fn(P, *mut RECT) -> HRESULT; rt, std::ptr::null_mut());
-    }
-    let release: unsafe extern "system" fn(P) -> u32 = std::mem::transmute(*(*(rt as *const *const usize)).add(2));
-    release(rt);
 }
 
 unsafe fn maybe_snapshot(dev: P, frame: usize) {
@@ -1344,9 +1285,6 @@ mod cursor {
             let Some(tex) = ensure_texture(s) else { return };
             let t = xf();
             let nr = scale_rect(&vr, t);
-            if let Ok(mut l) = super::LAST_CURSOR.lock() {
-                *l = Some(nr);
-            }
             let (tu, tv) = (s.image_size.0 as f32 / s.tex_size.0 as f32, s.image_size.1 as f32 / s.tex_size.1 as f32);
             let (x0, y0, x1, y1) = (nr.left as f32 - 0.5, nr.top as f32 - 0.5, nr.right as f32 - 0.5, nr.bottom as f32 - 0.5);
             let quad: [f32; 24] = [x0, y0, 0.0, 1.0, 0.0, 0.0, x1, y0, 0.0, 1.0, tu, 0.0, x0, y1, 0.0, 1.0, 0.0, tv, x1, y1, 0.0, 1.0, tu, tv];

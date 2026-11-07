@@ -191,7 +191,6 @@ development and bug hunting; set them in the shell you start the launcher from.
 | Variable                        | Effect |
 | ------------------------------- | ------ |
 | `DESIEGE_EXPERIMENT=profile`    | Samples the render thread for 10 s once in-game and logs where the time goes, per module and hot address. |
-| `DESIEGE_EXPERIMENT=whitehunt`  | Inspects every frame and dumps the first few that are mostly white to `white_<n>.bmp` (hunting one-frame flashes). |
 | `DESIEGE_EXPERIMENT=nodynvb`    | Disables the dynamic vertex buffer fix. |
 | `DESIEGE_SNAPSHOT=300,900`      | Saves the native back buffer at those frame numbers to `snap_<n>.bmp` (exclusive fullscreen can't be screen-captured). |
 | `DESIEGE_TRACE_FRAME=<n>`       | Logs every hooked graphics call of frame `<n>`. |
@@ -223,7 +222,6 @@ installed `Logic.dsres` (skipped if the game isn't installed; override the locat
 - A Tank archive *writer* and a proper mod manager in the launcher.
 - Field-of-view correction for ultrawide screens.
 - Legends of Aranna testing.
-- Dungeon Siege 2, eventually.
 
 ## Contributing
 
