@@ -103,6 +103,7 @@ unsafe fn real_proc(name: &CStr) -> usize {
             resolve_forwards(lib);
         }
         scale::install_input_hooks();
+        code_mods::load_all();
         lib
     });
     if lib == 0 {
@@ -600,6 +601,7 @@ unsafe extern "system" fn d3d_enum_zbuf(this: P, dev: *const Guid, cb: ZCb, ctx:
 // After the macros above: macro_rules are only visible to modules declared after them.
 mod scale;
 mod profile;
+mod code_mods;
 
 #[cfg(test)]
 mod tests {

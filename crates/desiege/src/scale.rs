@@ -92,6 +92,8 @@ static MAIN_SURFACES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 pub struct Xf { pub s: f32, pub ox: f32, pub oy: f32 }
 
 fn f(a: &AtomicU32) -> f32 { f32::from_bits(a.load(Relaxed)) }
+/// Current UI magnification for code mods (1.0 when not scaling).
+pub fn ui_scale_factor() -> f32 { if active() { f(&S) } else { 1.0 } }
 fn xf() -> Xf { Xf { s: f(&S), ox: f(&OX), oy: f(&OY) } }
 fn active() -> bool { ACTIVE.load(Relaxed) }
 fn v() -> (u32, u32) { (VW.load(Relaxed), VH.load(Relaxed)) }
@@ -565,6 +567,8 @@ unsafe extern "system" fn sf_flip(this: P, target: P, flags: u32) -> HRESULT {
     stat(FLIPS);
     let dev = DEVICE.load(Relaxed);
     if dev != 0 {
+        crate::code_mods::run_frame();
+        overlay::draw(dev as P);
         cursor::draw(dev as P);
     }
     let frame = SNAP_FRAME.swap(usize::MAX, Relaxed);
@@ -1068,6 +1072,287 @@ pub mod dynvb {
     }
 }
 
+// ---------------------------------------------------------------- our own quads (cursor, overlay)
+
+/// Helpers for drawing our own textured quads on top of the finished frame: ARGB textures on
+/// the game's DirectDraw object, and a draw pass that saves and restores every device state it
+/// touches. Used by the cursor overlay and by code mods' overlay text.
+pub mod gpu {
+    use super::*;
+
+    pub unsafe fn method<F>(obj: P, idx: usize) -> F {
+        std::mem::transmute_copy(&*(*(obj as *const *const usize)).add(idx))
+    }
+
+    /// An ARGB8888 (premultiplied) texture, power-of-two sized.
+    pub struct Tex {
+        ptr: usize,
+        owner: usize,
+        pub w: usize,
+        pub h: usize,
+    }
+
+    impl Tex {
+        /// Still usable (the game recreates its DirectDraw object on mode changes).
+        pub fn valid(&self) -> bool {
+            self.owner == DDRAW.load(Relaxed)
+        }
+        pub fn fits(&self, w: usize, h: usize) -> bool {
+            self.valid() && self.w >= w && self.h >= h
+        }
+    }
+
+    impl Drop for Tex {
+        fn drop(&mut self) {
+            // ponytail: a texture whose DirectDraw object is gone is just dropped, not Released.
+            if self.valid() {
+                unsafe { method::<unsafe extern "system" fn(P) -> u32>(self.ptr as P, 2)(self.ptr as P) };
+            }
+        }
+    }
+
+    pub unsafe fn create(w: usize, h: usize) -> Option<Tex> {
+        let pow2 = |n: usize| n.next_power_of_two().max(8);
+        let (tw, th) = (pow2(w), pow2(h));
+        let mut d = [0u32; 31];
+        d[0] = 124;
+        d[1] = 1 | 2 | 4 | 0x1000; // CAPS | HEIGHT | WIDTH | PIXELFORMAT
+        d[2] = th as u32;
+        d[3] = tw as u32;
+        d[18] = 32; // ddpfPixelFormat @72: size, flags RGB|ALPHAPIXELS, 32 bpp, ARGB masks
+        d[19] = 0x40 | 0x1;
+        d[21] = 32;
+        d[22] = 0x00FF_0000;
+        d[23] = 0x0000_FF00;
+        d[24] = 0x0000_00FF;
+        d[25] = 0xFF00_0000;
+        d[26] = 0x1000; // DDSCAPS_TEXTURE
+        d[27] = 0x10; // DDSCAPS2_TEXTUREMANAGE
+        let dd = DDRAW.load(Relaxed);
+        let create: unsafe extern "system" fn(P, *mut c_void, *mut P, P) -> HRESULT =
+            std::mem::transmute(crate::DD_CREATE_SURFACE.load(Relaxed));
+        let mut tex = std::ptr::null_mut();
+        let hr = create(dd as P, d.as_mut_ptr().cast(), &mut tex, std::ptr::null_mut());
+        if hr < 0 || tex.is_null() {
+            log!("overlay: texture create failed 0x{:08X}", hr as u32);
+            return None;
+        }
+        Some(Tex { ptr: tex as usize, owner: dd, w: tw, h: th })
+    }
+
+    /// Copy a w x h image into the top-left of the texture (the rest is cleared).
+    pub unsafe fn upload(t: &Tex, w: usize, h: usize, px: &[u32]) -> bool {
+        let mut d = [0u32; 31];
+        d[0] = 124;
+        let hr = call!(SF_LOCK as fn(P, *mut RECT, *mut c_void, u32, P) -> HRESULT;
+            t.ptr as P, std::ptr::null_mut(), d.as_mut_ptr().cast(), DDLOCK_WAIT | DDLOCK_WRITEONLY, std::ptr::null_mut());
+        if hr < 0 {
+            return false;
+        }
+        let (bits, pitch) = (d[9] as *mut u8, d[4] as usize);
+        for y in 0..t.h {
+            let row = bits.add(y * pitch) as *mut u32;
+            for x in 0..t.w {
+                *row.add(x) = if x < w && y < h { px[y * w + x] } else { 0 };
+            }
+        }
+        call!(SF_UNLOCK as fn(P, *mut RECT) -> HRESULT; t.ptr as P, std::ptr::null_mut());
+        true
+    }
+
+    /// One quad: where (native screen pixels) and how much of the texture (w x h pixels).
+    pub struct Quad<'a> {
+        pub tex: &'a Tex,
+        pub rect: RECT,
+        pub w: usize,
+        pub h: usize,
+    }
+
+    /// Draw premultiplied-alpha quads in their own scene, clipped to `clip`, restoring every
+    /// state we change. `point` = nearest-neighbour sampling (whole-number scales).
+    pub unsafe fn draw(dev: P, clip: Viewport, point: bool, quads: &[Quad]) {
+        if quads.is_empty() {
+            return;
+        }
+        let get_rs: unsafe extern "system" fn(P, u32, *mut u32) -> HRESULT = method(dev, 21);
+        let set_rs: unsafe extern "system" fn(P, u32, u32) -> HRESULT = method(dev, 20);
+        let get_ts: unsafe extern "system" fn(P, u32, u32, *mut u32) -> HRESULT = method(dev, 36);
+        let set_ts: unsafe extern "system" fn(P, u32, u32, u32) -> HRESULT = method(dev, 37);
+        let get_tex: unsafe extern "system" fn(P, u32, *mut P) -> HRESULT = method(dev, 34);
+        let set_tex: unsafe extern "system" fn(P, u32, P) -> HRESULT = method(dev, 35);
+        let begin: unsafe extern "system" fn(P) -> HRESULT = method(dev, 5);
+        // ZENABLE, ZWRITE, ALPHABLEND, SRCBLEND=ONE, DESTBLEND=INVSRCALPHA, ALPHATEST,
+        // CULL=NONE, FOG, SPECULAR, COLORKEY, STENCIL
+        let rs: [(u32, u32); 11] = [(7, 0), (14, 0), (27, 1), (19, 2), (20, 6), (15, 0), (22, 1), (28, 0), (29, 0), (41, 0), (52, 0)];
+        let filter = if point { 1 } else { 2 };
+        // stage 0: COLOROP/ALPHAOP = SELECTARG1 of TEXTURE, clamp, filters, coord set 0; stage 1 off
+        let ts: [(u32, u32, u32); 12] =
+            [(0, 1, 2), (0, 2, 2), (0, 4, 2), (0, 5, 2), (0, 12, 3), (0, 16, filter), (0, 17, filter), (0, 18, 1), (0, 11, 0), (0, 24, 0), (1, 1, 1), (1, 4, 1)];
+        let saved_rs: Vec<(u32, u32)> =
+            rs.iter().filter_map(|&(k, _)| { let mut v = 0; (get_rs(dev, k, &mut v) >= 0).then_some((k, v)) }).collect();
+        let saved_ts: Vec<(u32, u32, u32)> =
+            ts.iter().filter_map(|&(st, k, _)| { let mut v = 0; (get_ts(dev, st, k, &mut v) >= 0).then_some((st, k, v)) }).collect();
+        let mut old_tex = std::ptr::null_mut();
+        get_tex(dev, 0, &mut old_tex);
+        let mut old_vp = Viewport { x: 0, y: 0, w: 0, h: 0, min_z: 0.0, max_z: 1.0 };
+        let have_vp = call!(DEV_GET_VP as fn(P, *mut Viewport) -> HRESULT; dev, &mut old_vp) >= 0;
+
+        if begin(dev) >= 0 {
+            call!(DEV_SET_VP as fn(P, *const Viewport) -> HRESULT; dev, &clip);
+            for &(k, v) in &rs { set_rs(dev, k, v); }
+            for &(st, k, v) in &ts { set_ts(dev, st, k, v); }
+            for q in quads {
+                let (tu, tv) = (q.w as f32 / q.tex.w as f32, q.h as f32 / q.tex.h as f32);
+                let r = &q.rect;
+                let (x0, y0, x1, y1) = (r.left as f32 - 0.5, r.top as f32 - 0.5, r.right as f32 - 0.5, r.bottom as f32 - 0.5);
+                let quad: [f32; 24] = [x0, y0, 0.0, 1.0, 0.0, 0.0, x1, y0, 0.0, 1.0, tu, 0.0, x0, y1, 0.0, 1.0, 0.0, tv, x1, y1, 0.0, 1.0, tu, tv];
+                set_tex(dev, 0, q.tex.ptr as P);
+                const TRIANGLESTRIP: u32 = 5; const FVF: u32 = 0x104; // XYZRHW | TEX1
+                call!(DEV_DP as fn(P, u32, u32, *const c_void, u32, u32) -> HRESULT; dev, TRIANGLESTRIP, FVF, quad.as_ptr().cast(), 4, 0);
+            }
+            call!(DEV_END_SCENE as fn(P) -> HRESULT; dev);
+        }
+        set_tex(dev, 0, old_tex);
+        if !old_tex.is_null() {
+            method::<unsafe extern "system" fn(P) -> u32>(old_tex, 2)(old_tex);
+        }
+        for (k, v) in saved_rs { set_rs(dev, k, v); }
+        for (st, k, v) in saved_ts { set_ts(dev, st, k, v); }
+        if have_vp {
+            call!(DEV_SET_VP as fn(P, *const Viewport) -> HRESULT; dev, &old_vp);
+        }
+    }
+
+    /// The real screen: native size when scaling, else the game's mode.
+    pub fn screen() -> (u32, u32) {
+        if active() { native() } else { v() }
+    }
+    pub fn full_screen() -> Viewport {
+        let (w, h) = screen();
+        Viewport { x: 0, y: 0, w, h, min_z: 0.0, max_z: 1.0 }
+    }
+}
+
+// ---------------------------------------------------------------- overlay text (code mods)
+
+/// Text drawn on top of the frame for code mods (`draw_text` in the mod API). Each item is
+/// rendered with GDI (Segoe UI, greyscale antialiasing) into a texture with a soft drop
+/// shadow, then drawn as a quad at Flip. Items are queued during the frame and drawn once.
+pub mod overlay {
+    use super::*;
+    use windows_sys::Win32::Graphics::Gdi::*;
+
+    pub struct Item {
+        pub x: i32,
+        pub y: i32,
+        pub text: Vec<u16>,
+        pub argb: u32,
+        pub size: i32,
+        /// 0 = left, 1 = centre, 2 = right of x
+        pub align: u32,
+    }
+    static QUEUE: Mutex<Vec<Item>> = Mutex::new(Vec::new());
+    /// Texture per queue slot, reused frame to frame.
+    struct Cache(Vec<Option<gpu::Tex>>);
+    static CACHE: Mutex<Cache> = Mutex::new(Cache(Vec::new()));
+    // The cache only ever lives on the render thread; the Mutex is just for static storage.
+    unsafe impl Send for Cache {}
+
+    pub fn queue(item: Item) {
+        if let Ok(mut q) = QUEUE.lock() {
+            if q.len() < 64 {
+                q.push(item);
+            }
+        }
+    }
+
+    /// Render `text` to premultiplied ARGB: (pixels, width, height).
+    unsafe fn rasterize(text: &[u16], size: i32, argb: u32) -> Option<(Vec<u32>, usize, usize)> {
+        let dc = CreateCompatibleDC(std::ptr::null_mut());
+        if dc.is_null() {
+            return None;
+        }
+        let face: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
+        const FW_SEMIBOLD: i32 = 600; const ANTIALIASED_QUALITY: u32 = 4;
+        let font = CreateFontW(-size, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, 1 /* DEFAULT_CHARSET */, 0, 0, ANTIALIASED_QUALITY, 0, face.as_ptr());
+        let old_font = SelectObject(dc, font as _);
+        let mut sz = windows_sys::Win32::Foundation::SIZE { cx: 0, cy: 0 };
+        GetTextExtentPoint32W(dc, text.as_ptr(), text.len() as i32, &mut sz);
+        let pad = (size / 10).max(2) as usize;
+        let (w, h) = (sz.cx as usize + 2 * pad, sz.cy as usize + 2 * pad);
+        let mut result = None;
+        if w > 0 && h > 0 && w <= 4096 && h <= 1024 {
+            let mut bi: BITMAPINFO = std::mem::zeroed();
+            bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            bi.bmiHeader.biWidth = w as i32;
+            bi.bmiHeader.biHeight = -(h as i32); // top-down
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            let mut bits = std::ptr::null_mut();
+            let dib = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+            if !dib.is_null() && !bits.is_null() {
+                let old_bmp = SelectObject(dc, dib as _);
+                std::ptr::write_bytes(bits as *mut u8, 0, w * h * 4);
+                SetBkMode(dc, 1 /* TRANSPARENT */);
+                SetTextColor(dc, 0x00FF_FFFF);
+                TextOutW(dc, pad as i32, pad as i32, text.as_ptr(), text.len() as i32);
+                GdiFlush();
+                // White-on-black coverage -> alpha mask; shadow = mask offset down-right.
+                let src = std::slice::from_raw_parts(bits as *const u32, w * h);
+                let cover = |x: isize, y: isize| -> u32 {
+                    if x < 0 || y < 0 || x >= w as isize || y >= h as isize { 0 } else { (src[y as usize * w + x as usize] >> 8) & 0xFF }
+                };
+                let (ca, cr, cg, cb) = ((argb >> 24) & 0xFF, (argb >> 16) & 0xFF, (argb >> 8) & 0xFF, argb & 0xFF);
+                let off = (size / 14).max(1) as isize;
+                let mut out = vec![0u32; w * h];
+                for y in 0..h as isize {
+                    for x in 0..w as isize {
+                        let t = cover(x, y) * ca / 255; // text alpha
+                        let s = cover(x - off, y - off) * 200 / 255; // shadow alpha (black)
+                        let a = t + s * (255 - t) / 255;
+                        let pm = |c: u32| c * t / 255; // premultiplied text colour (shadow is black)
+                        out[y as usize * w + x as usize] = (a << 24) | (pm(cr) << 16) | (pm(cg) << 8) | pm(cb);
+                    }
+                }
+                result = Some((out, w, h));
+                SelectObject(dc, old_bmp);
+                DeleteObject(dib as _);
+            }
+        }
+        SelectObject(dc, old_font);
+        DeleteObject(font as _);
+        DeleteDC(dc);
+        result
+    }
+
+    /// Draw everything queued this frame. Called right before Flip.
+    pub unsafe fn draw(dev: P) {
+        let items = QUEUE.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
+        if items.is_empty() || DDRAW.load(Relaxed) == 0 {
+            return;
+        }
+        let Ok(mut cache) = CACHE.lock() else { return };
+        let mut placed = Vec::new();
+        for (i, it) in items.iter().enumerate() {
+            let Some((px, w, h)) = rasterize(&it.text, it.size.clamp(6, 200), it.argb) else { continue };
+            if cache.0.len() <= i {
+                cache.0.resize_with(i + 1, || None);
+            }
+            if !cache.0[i].as_ref().is_some_and(|t| t.fits(w, h)) {
+                cache.0[i] = gpu::create(w, h);
+            }
+            let Some(tex) = cache.0[i].as_ref() else { continue };
+            if !gpu::upload(tex, w, h, &px) {
+                continue;
+            }
+            let x = match it.align { 1 => it.x - w as i32 / 2, 2 => it.x - w as i32, _ => it.x };
+            placed.push((i, RECT { left: x, top: it.y, right: x + w as i32, bottom: it.y + h as i32 }, w, h));
+        }
+        let quads: Vec<gpu::Quad> = placed.iter().filter_map(|&(i, rect, w, h)| Some(gpu::Quad { tex: cache.0[i].as_ref()?, rect, w, h })).collect();
+        gpu::draw(dev, gpu::full_screen(), false, &quads);
+    }
+}
+
 // ---------------------------------------------------------------- cursor overlay
 
 /// The game draws its cursor by locking the back buffer: read the 64x64 block under the
@@ -1098,11 +1383,11 @@ mod cursor {
         rect: Option<RECT>,
         /// Current lock: surface, V rect, buffer, write?
         pending: Option<(usize, RECT, Vec<u32>, bool)>,
-        tex: usize,
-        tex_owner: usize,
-        tex_size: (usize, usize),
+        tex: Option<gpu::Tex>,
     }
     static STATE: Mutex<Option<State>> = Mutex::new(None);
+    // Only touched from the render thread; the Mutex is just for static storage.
+    unsafe impl Send for State {}
 
     fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
         STATE.lock().ok().map(|mut s| f(s.get_or_insert_with(State::default)))
@@ -1201,71 +1486,6 @@ mod cursor {
         .unwrap_or(false)
     }
 
-    unsafe fn method<F>(obj: P, idx: usize) -> F {
-        std::mem::transmute_copy(&*(*(obj as *const *const usize)).add(idx))
-    }
-
-    /// (Re)create the texture on the current DirectDraw object and upload the image.
-    unsafe fn ensure_texture(s: &mut State) -> Option<P> {
-        let dd = DDRAW.load(Relaxed);
-        let (w, h) = s.image_size;
-        let pow2 = |n: usize| n.next_power_of_two().max(8);
-        let want = (pow2(w), pow2(h));
-        if s.tex != 0 && (s.tex_owner != dd || s.tex_size != want) {
-            // ponytail: a texture from a released DirectDraw object is just dropped, not
-            // Released (its owner is gone); a few KB leaked per mode change.
-            if s.tex_owner == dd {
-                method::<unsafe extern "system" fn(P) -> u32>(s.tex as P, 2)(s.tex as P);
-            }
-            s.tex = 0;
-        }
-        if s.tex == 0 {
-            let mut d = [0u32; 31];
-            d[0] = 124;
-            d[1] = 1 | 2 | 4 | 0x1000; // CAPS | HEIGHT | WIDTH | PIXELFORMAT
-            d[2] = want.1 as u32;
-            d[3] = want.0 as u32;
-            d[18] = 32; // ddpfPixelFormat @72: size, flags RGB|ALPHAPIXELS, 32 bpp, ARGB masks
-            d[19] = 0x40 | 0x1;
-            d[21] = 32;
-            d[22] = 0x00FF_0000;
-            d[23] = 0x0000_FF00;
-            d[24] = 0x0000_00FF;
-            d[25] = 0xFF00_0000;
-            d[26] = 0x1000; // DDSCAPS_TEXTURE
-            d[27] = 0x10; // DDSCAPS2_TEXTUREMANAGE
-            let mut tex = std::ptr::null_mut();
-            let create: unsafe extern "system" fn(P, *mut c_void, *mut P, P) -> HRESULT =
-                std::mem::transmute(crate::DD_CREATE_SURFACE.load(Relaxed));
-            let hr = create(dd as P, d.as_mut_ptr().cast(), &mut tex, std::ptr::null_mut());
-            if hr < 0 || tex.is_null() {
-                log!("cursor overlay: texture create failed 0x{:08X}", hr as u32);
-                return None;
-            }
-            (s.tex, s.tex_owner, s.tex_size, s.dirty) = (tex as usize, dd, want, true);
-            log!("cursor overlay: texture {}x{} for a {w}x{h} cursor", want.0, want.1);
-        }
-        if s.dirty {
-            let mut d = [0u32; 31];
-            d[0] = 124;
-            let tex = s.tex as P;
-            let hr = call!(SF_LOCK as fn(P, *mut RECT, *mut c_void, u32, P) -> HRESULT;
-                tex, std::ptr::null_mut(), d.as_mut_ptr().cast(), DDLOCK_WAIT | DDLOCK_WRITEONLY, std::ptr::null_mut());
-            if hr >= 0 {
-                let (bits, pitch) = (d[9] as *mut u8, d[4] as usize);
-                for y in 0..want.1 {
-                    let row = bits.add(y * pitch) as *mut u32;
-                    for x in 0..want.0 {
-                        *row.add(x) = if x < w && y < h { s.image[y * w + x] } else { 0 };
-                    }
-                }
-                call!(SF_UNLOCK as fn(P, *mut RECT) -> HRESULT; tex, std::ptr::null_mut());
-                s.dirty = false;
-            }
-        }
-        Some(s.tex as P)
-    }
-
     /// Draw this frame's cursor (if the game drew one) as a quad. Called right before Flip.
     pub unsafe fn draw(dev: P) {
         with(|s| {
@@ -1282,59 +1502,21 @@ mod cursor {
             if vr.bottom - vr.top < fh {
                 if vr.top <= 2 { vr.top = vr.bottom - fh } else { vr.bottom = vr.top + fh }
             }
-            let Some(tex) = ensure_texture(s) else { return };
+            let (w, h) = s.image_size;
+            if !s.tex.as_ref().is_some_and(|t| t.fits(w, h)) {
+                s.tex = gpu::create(w, h);
+                s.dirty = true;
+            }
+            let Some(tex) = s.tex.as_ref() else { return };
+            if s.dirty {
+                s.dirty = !gpu::upload(tex, w, h, &s.image);
+            }
             let t = xf();
-            let nr = scale_rect(&vr, t);
-            let (tu, tv) = (s.image_size.0 as f32 / s.tex_size.0 as f32, s.image_size.1 as f32 / s.tex_size.1 as f32);
-            let (x0, y0, x1, y1) = (nr.left as f32 - 0.5, nr.top as f32 - 0.5, nr.right as f32 - 0.5, nr.bottom as f32 - 0.5);
-            let quad: [f32; 24] = [x0, y0, 0.0, 1.0, 0.0, 0.0, x1, y0, 0.0, 1.0, tu, 0.0, x0, y1, 0.0, 1.0, 0.0, tv, x1, y1, 0.0, 1.0, tu, tv];
-
-            // Save what we touch, draw, restore.
-            let get_rs: unsafe extern "system" fn(P, u32, *mut u32) -> HRESULT = method(dev, 21);
-            let set_rs: unsafe extern "system" fn(P, u32, u32) -> HRESULT = method(dev, 20);
-            let get_ts: unsafe extern "system" fn(P, u32, u32, *mut u32) -> HRESULT = method(dev, 36);
-            let set_ts: unsafe extern "system" fn(P, u32, u32, u32) -> HRESULT = method(dev, 37);
-            let get_tex: unsafe extern "system" fn(P, u32, *mut P) -> HRESULT = method(dev, 34);
-            let set_tex: unsafe extern "system" fn(P, u32, P) -> HRESULT = method(dev, 35);
-            let begin: unsafe extern "system" fn(P) -> HRESULT = method(dev, 5);
-            // ZENABLE, ZWRITE, ALPHABLEND, SRCBLEND=ONE, DESTBLEND=INVSRCALPHA, ALPHATEST,
-            // CULL=NONE, FOG, SPECULAR, COLORKEY, STENCIL
-            let rs: [(u32, u32); 11] = [(7, 0), (14, 0), (27, 1), (19, 2), (20, 6), (15, 0), (22, 1), (28, 0), (29, 0), (41, 0), (52, 0)];
-            let filter = if t.s.fract() == 0.0 { 1 } else { 2 }; // point at whole scales
-            // stage 0: COLOROP/ALPHAOP = SELECTARG1 of TEXTURE, clamp, filters, coord set 0; stage 1 off
-            let ts: [(u32, u32, u32); 12] =
-                [(0, 1, 2), (0, 2, 2), (0, 4, 2), (0, 5, 2), (0, 12, 3), (0, 16, filter), (0, 17, filter), (0, 18, 1), (0, 11, 0), (0, 24, 0), (1, 1, 1), (1, 4, 1)];
-            let saved_rs: Vec<(u32, u32)> =
-                rs.iter().filter_map(|&(k, _)| { let mut v = 0; (get_rs(dev, k, &mut v) >= 0).then_some((k, v)) }).collect();
-            let saved_ts: Vec<(u32, u32, u32)> =
-                ts.iter().filter_map(|&(st, k, _)| { let mut v = 0; (get_ts(dev, st, k, &mut v) >= 0).then_some((st, k, v)) }).collect();
-            let mut old_tex = std::ptr::null_mut();
-            get_tex(dev, 0, &mut old_tex);
-            let mut old_vp = Viewport { x: 0, y: 0, w: 0, h: 0, min_z: 0.0, max_z: 1.0 };
-            let have_vp = call!(DEV_GET_VP as fn(P, *mut Viewport) -> HRESULT; dev, &mut old_vp) >= 0;
             // Clip to the picture: in letterboxed modes (4:3 menus) nothing clears the side
             // bars, so a cursor drawn there would leave a trail of copies.
             let c = content_rect(t);
-            let full = Viewport { x: c.left as u32, y: c.top as u32, w: (c.right - c.left) as u32, h: (c.bottom - c.top) as u32, min_z: 0.0, max_z: 1.0 };
-
-            if begin(dev) >= 0 {
-                call!(DEV_SET_VP as fn(P, *const Viewport) -> HRESULT; dev, &full);
-                for &(k, v) in &rs { set_rs(dev, k, v); }
-                for &(st, k, v) in &ts { set_ts(dev, st, k, v); }
-                set_tex(dev, 0, tex);
-                const TRIANGLESTRIP: u32 = 5; const FVF: u32 = 0x104; // XYZRHW | TEX1
-                call!(DEV_DP as fn(P, u32, u32, *const c_void, u32, u32) -> HRESULT; dev, TRIANGLESTRIP, FVF, quad.as_ptr().cast(), 4, 0);
-                call!(DEV_END_SCENE as fn(P) -> HRESULT; dev);
-            }
-            set_tex(dev, 0, old_tex);
-            if !old_tex.is_null() {
-                method::<unsafe extern "system" fn(P) -> u32>(old_tex, 2)(old_tex);
-            }
-            for (k, v) in saved_rs { set_rs(dev, k, v); }
-            for (st, k, v) in saved_ts { set_ts(dev, st, k, v); }
-            if have_vp {
-                call!(DEV_SET_VP as fn(P, *const Viewport) -> HRESULT; dev, &old_vp);
-            }
+            let clip = Viewport { x: c.left as u32, y: c.top as u32, w: (c.right - c.left) as u32, h: (c.bottom - c.top) as u32, min_z: 0.0, max_z: 1.0 };
+            gpu::draw(dev, clip, t.s.fract() == 0.0, &[gpu::Quad { tex, rect: scale_rect(&vr, t), w, h }]);
         });
     }
 }

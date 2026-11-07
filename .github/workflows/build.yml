@@ -58,6 +58,9 @@ jobs:
           $dir = "dist/$name"
           New-Item -ItemType Directory -Force $dir | Out-Null
           Copy-Item target/release/desiege-launcher.exe, target/release/desiege.dll, target/release/desiege-loader.exe, target/release/ddraw-stub.dll, README.md, LICENSE $dir
+          # Example code mod plus the mod API header, for people writing their own.
+          Copy-Item -Recurse target/release/example-mods "$dir/example-mods"
+          Copy-Item crates/desiege/include/desiege_mod.h "$dir/example-mods/"
           Compress-Archive -Path $dir -DestinationPath "dist/$name.zip"
           $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"

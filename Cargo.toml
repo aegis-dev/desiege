@@ -1,5 +1,5 @@
 [workspace]
-members = ["launcher", "crates/desiege", "crates/ddraw-stub", "crates/tank"]
+members = ["launcher", "crates/desiege", "crates/ddraw-stub", "crates/tank", "mods/fps-counter"]
 resolver = "2"
 
 # Unwinding a Rust panic into game/C code is UB; abort instead.

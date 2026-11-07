@@ -1,0 +1,11 @@
+[package]
+name = "fps-counter"
+version = "0.1.0"
+edition = "2021"
+description = "Example Desiege code mod: shows the frame rate at the top of the screen"
+
+# A code mod is a 32-bit DLL: cargo build -p fps-counter --release --target i686-pc-windows-msvc
+# Output: target/i686-pc-windows-msvc/release/fps_counter.dll
+
+[lib]
+crate-type = ["cdylib"]

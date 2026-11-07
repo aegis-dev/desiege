@@ -7,7 +7,7 @@
   "app": {
     "withGlobalTauri": true,
     "windows": [
-      { "title": "Desiege — Dungeon Siege Launcher", "width": 520, "height": 830, "resizable": false }
+      { "title": "Desiege — Dungeon Siege Launcher", "width": 600, "height": 680, "resizable": false }
     ],
     "security": { "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'" }
   },

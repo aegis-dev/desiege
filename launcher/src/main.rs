@@ -9,6 +9,8 @@ use std::{
 };
 use tauri::Manager;
 
+mod mods;
+
 const EXE: &str = "DungeonSiege.exe";
 
 /// dxwrapper (https://github.com/elishacloud/dxwrapper, zlib license) translates the game's
@@ -150,7 +152,7 @@ fn dxwrapper_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 /// Run a tool from System32 by full path (no PATH lookup), hidden, returning stdout.
-fn system_tool(name: &str, args: &[&std::ffi::OsStr]) -> Result<String, String> {
+pub(crate) fn system_tool(name: &str, args: &[&std::ffi::OsStr]) -> Result<String, String> {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
     let out = Command::new(Path::new(&root).join("System32").join(name))
@@ -180,10 +182,28 @@ fn dxwrapper_links() -> [&'static str; 3] {
     DXWRAPPER_LINKS
 }
 
-/// Only the fixed dxwrapper links can be opened (the page can't ask for arbitrary URLs).
+const REPO_URL: &str = "https://github.com/aegis-dev/desiege";
+const PROJECT_LINKS: [&str; 3] = [
+    REPO_URL,
+    "https://github.com/aegis-dev/desiege/releases",
+    "https://github.com/aegis-dev/desiege/issues",
+];
+
+#[derive(Serialize)]
+struct AppInfo {
+    version: &'static str,
+    links: [&'static str; 3],
+}
+
+#[tauri::command]
+fn app_info() -> AppInfo {
+    AppInfo { version: env!("CARGO_PKG_VERSION"), links: PROJECT_LINKS }
+}
+
+/// Only fixed links can be opened (the page can't ask for arbitrary URLs).
 #[tauri::command]
 fn open_link(url: String) -> Result<(), String> {
-    if !DXWRAPPER_LINKS.contains(&url.as_str()) {
+    if !DXWRAPPER_LINKS.contains(&url.as_str()) && !PROJECT_LINKS.contains(&url.as_str()) {
         return Err("link not allowed".into());
     }
     Command::new("explorer.exe").arg(&url).spawn().map(|_| ()).map_err(|e| e.to_string())
@@ -358,11 +378,11 @@ fn launch(app: tauri::AppHandle, settings: Settings) -> Result<(), String> {
     // Mods are .dsmod tanks; the engine looks for them in `mod_paths` (default: <game>\Mods).
     // ponytail: a profile path with spaces gets quoted on the command line; untested whether
     // the game's own parser strips the quotes.
-    let mods = app.path().app_data_dir().map_err(|e| e.to_string())?.join("mods");
-    fs::create_dir_all(&mods).map_err(|e| e.to_string())?;
+    let lib = mods::dirs(&app)?;
     cmd.current_dir(&dir)
         .args(launch_args(&settings))
-        .arg(format!("mod_paths={}", mods.display()))
+        .arg(format!("mod_paths={}", lib.mods.display()))
+        .arg(format!("map_paths={}", lib.maps.display()))
         // Game is DPI-unaware; without this Windows virtualizes it at 125%+ scaling
         // and the fullscreen image comes out blurry or cropped.
         .env("__COMPAT_LAYER", "HighDpiAware");
@@ -378,6 +398,35 @@ fn launch(app: tauri::AppHandle, settings: Settings) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn list_mods(app: tauri::AppHandle) -> Result<Vec<mods::ModFile>, String> {
+    Ok(mods::list(&mods::dirs(&app)?))
+}
+
+#[tauri::command]
+/// `trusted`: the user confirmed enabling a code mod in the UI.
+fn set_mod_enabled(app: tauri::AppHandle, file: String, enabled: bool, trusted: Option<bool>) -> Result<(), String> {
+    mods::set_enabled(&mods::dirs(&app)?, &file, enabled, trusted.unwrap_or(false))
+}
+
+#[tauri::command]
+fn remove_mod(app: tauri::AppHandle, file: String) -> Result<(), String> {
+    mods::remove(&mods::dirs(&app)?, &file)
+}
+
+/// Paths come from files dropped on the launcher window.
+#[tauri::command]
+async fn install_mods(app: tauri::AppHandle, paths: Vec<String>) -> Result<mods::InstallReport, String> {
+    let scratch = app.path().app_local_data_dir().map_err(|e| e.to_string())?.join("tmp");
+    Ok(mods::install(&mods::dirs(&app)?, &scratch, &paths))
+}
+
+#[tauri::command]
+fn open_mods_folder(app: tauri::AppHandle) -> Result<(), String> {
+    let d = mods::dirs(&app)?;
+    Command::new("explorer.exe").arg(d.mods.parent().unwrap()).spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -388,7 +437,13 @@ fn main() {
             dxwrapper_installed,
             dxwrapper_links,
             install_dxwrapper,
-            open_link
+            open_link,
+            app_info,
+            list_mods,
+            set_mod_enabled,
+            remove_mod,
+            install_mods,
+            open_mods_folder
         ])
         .run(tauri::generate_context!())
         .expect("error while running launcher");
