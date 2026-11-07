@@ -1,0 +1,83 @@
+name: Build
+
+# Every push and pull request: run the tests and build everything.
+# A pushed tag like v0.1.0 also publishes a GitHub Release with a ready-to-run zip.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # only used by the release step, on tags
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (+ 32-bit target for the game side)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add i686-pc-windows-msvc
+          rustc --version
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Test
+        run: |
+          cargo test -p desiege-launcher -p tank --release
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          # The tank test reads the installed game's archives and skips itself here.
+          cargo test -p desiege --target i686-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Build
+        run: ./build.ps1
+
+      - name: Package
+        id: package
+        run: |
+          $version = if ($env:GITHUB_REF -like "refs/tags/v*") { $env:GITHUB_REF_NAME } else { "dev-$($env:GITHUB_SHA.Substring(0, 7))" }
+          $name = "desiege-$version-windows-x64"
+          $dir = "dist/$name"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item target/release/desiege-launcher.exe, target/release/desiege.dll, target/release/desiege-loader.exe, target/release/ddraw-stub.dll, README.md, LICENSE $dir
+          Compress-Archive -Path $dir -DestinationPath "dist/$name.zip"
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"
+          Get-ChildItem dist
+          "name=$name" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = ".github/release-notes/$env:GITHUB_REF_NAME.md"
+          $args = @("dist/${{ steps.package.outputs.name }}.zip", "dist/${{ steps.package.outputs.name }}.zip.sha256", "--title", "Desiege $env:GITHUB_REF_NAME")
+          if (Test-Path $notes) { $args += @("--notes-file", $notes) } else { $args += "--generate-notes" }
+          if ($env:GITHUB_REF_NAME -match "^v0\.") { $args += "--prerelease" }
+          gh release create $env:GITHUB_REF_NAME @args
