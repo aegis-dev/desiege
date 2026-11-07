@@ -43,7 +43,7 @@ runs, and turning Desiege off gives you the untouched original back.
   `%APPDATA%\dev.desiege.launcher\mods`, so `.dsmod` files can live there instead of in the game
   directory.
 - **Small and dependency-light.** The launcher is a ~5 MB [Tauri](https://tauri.app) app that uses
-  the WebView2 runtime already present on Windows 10/11; the in-game part is a ~150 KB DLL.
+  the WebView2 runtime already present on Windows 10/11.
 
 ## Requirements
 
