@@ -85,6 +85,13 @@ unsafe fn rd(p: *const c_void, off: usize) -> u32 { *(p as *const u8).add(off).c
 unsafe fn real_proc(name: &CStr) -> usize {
     static LIB: OnceLock<usize> = OnceLock::new();
     let lib = *LIB.get_or_init(|| {
+        if let Some(cap) = FPS_CAP_LIFTED.get() {
+            log!("GOG exe: lifted its hard-coded 60 fps cap (maxfps now {})", if *cap > 0.0 { cap.to_string() } else { "unlimited".into() });
+        }
+        let game = GAME_DDRAW.load(Relaxed);
+        if game != 0 && GetModuleHandleW(system_ddraw_path().as_ptr()) as usize != game {
+            log!("game imported {}; bypassing it (routing to system ddraw)", module_path(game));
+        }
         // Windows' own D3D7 runtime can't create a device on render targets wider than 2048 px
         // (see examples/rtsize.rs), so native-resolution play needs dxwrapper (D3D7 -> D3D9).
         // Path comes from DESIEGE_DXWRAPPER (set by the launcher) or, for Steam launches, the
@@ -200,6 +207,36 @@ unsafe fn hook_iat(module: usize, target: usize, hook: usize, orig: &AtomicUsize
     hit
 }
 
+/// Point `module`'s import of `dll!func` at `hook`, found by name, saving whatever the slot
+/// held (the real function, or an AppCompat shim's wrapper, which `hook_iat` can't match by
+/// address: GOG registers a HIGHDPIAWARE layer that shims GetCursorPos & co.).
+unsafe fn hook_import(module: usize, dll: &CStr, func: &CStr, hook: usize, orig: &AtomicUsize) -> bool {
+    let pe = (module + rd(module as P, 0x3C) as usize) as P;
+    let mut desc = module + rd(pe, 24 + 96 + 8) as usize;
+    while rd(desc as P, 12) != 0 {
+        let name = CStr::from_ptr((module + rd(desc as P, 12) as usize) as *const c_char);
+        if name.to_bytes().eq_ignore_ascii_case(dll.to_bytes()) {
+            let (names, slots) = (rd(desc as P, 0) as usize, rd(desc as P, 16) as usize);
+            for i in 0.. {
+                let thunk = rd((module + if names != 0 { names } else { slots }) as P, i * 4);
+                if thunk == 0 {
+                    break;
+                }
+                if thunk & 0x8000_0000 == 0 && CStr::from_ptr((module + thunk as usize + 2) as *const c_char) == func {
+                    let slot = (module + slots + i * 4) as *mut usize;
+                    if *slot != hook {
+                        orig.store(*slot, Relaxed);
+                        write_ptr(slot, hook);
+                    }
+                    return true;
+                }
+            }
+        }
+        desc += 20;
+    }
+    false
+}
+
 /// Declares the static holding a hook's original method pointer (signature is documentation;
 /// `call!` repeats it when transmuting).
 macro_rules! orig {
@@ -227,23 +264,113 @@ pub unsafe extern "system" fn DllMain(module: P, reason: u32, _: P) -> i32 {
         SELF_MODULE.store(module as usize, Relaxed);
         // Only pointer writes here (loader lock): no LoadLibrary, no file I/O.
         let exe = GetModuleHandleW(std::ptr::null()) as usize;
+        // Injected by desiege-loader (rather than loaded via our stub): the game already
+        // imported a ddraw.dll, so route its two imports through our exports. That's the system
+        // one on Steam, and GOG's own D3D7->D3D9 wrapper (game folder ddraw.dll) on GOG, which
+        // we bypass this way: our exports go to system ddraw + dxwrapper, the tested path.
+        // Our stub (it exports the marker) already forwards here; leave it alone.
+        let name: Vec<u16> = "ddraw.dll\0".encode_utf16().collect();
+        let imported = GetModuleHandleW(name.as_ptr()) as usize;
+        let ours = imported == 0 || imported == module as usize || proc_in(imported, c"DESIEGE_STUB_MARKER") != 0;
+        GAME_DDRAW.store(if ours { 0 } else { imported }, Relaxed);
+        if vanilla() {
+            // Measure-only: the game keeps its own ddraw (and system_detail.gas); we only count frames.
+            if !ours {
+                hook_iat(exe, proc_in(imported, c"DirectDrawCreateEx"), vanilla_create_ex as usize, &VANILLA_CREATE);
+            }
+            // vanilla,uncap: also lift GOG's 60 fps cap, to measure GOG's own renderer.
+            if std::env::var("DESIEGE_EXPERIMENT").unwrap_or_default().split(',').any(|e| e.trim() == "uncap") {
+                lift_gog_fps_cap(exe);
+            }
+            return 1;
+        }
+        lift_gog_fps_cap(exe);
         let k32: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
         let target = proc_in(GetModuleHandleW(k32.as_ptr()) as usize, c"CreateFileA");
         hook_iat(exe, target, create_file_a as usize, &CREATE_FILE_A);
         let target = proc_in(GetModuleHandleW(k32.as_ptr()) as usize, c"FindFirstFileA");
         hook_iat(exe, target, find_first_file_a as usize, &FIND_FIRST_FILE_A);
-
-        // Injected by desiege-loader (rather than loaded as the game's ddraw.dll): the game
-        // already imported the system ddraw, so route its two imports through our exports.
-        // As a drop-in ddraw.dll the system one isn't loaded yet and this finds nothing.
-        let sys = GetModuleHandleW(system_ddraw_path().as_ptr()) as usize;
-        if sys != 0 {
+        if !ours {
             static UNUSED: AtomicUsize = AtomicUsize::new(0);
-            hook_iat(exe, proc_in(sys, c"DirectDrawCreateEx"), DirectDrawCreateEx as usize, &UNUSED);
-            hook_iat(exe, proc_in(sys, c"DirectDrawEnumerateExA"), DirectDrawEnumerateExA as usize, &UNUSED);
+            hook_iat(exe, proc_in(imported, c"DirectDrawCreateEx"), DirectDrawCreateEx as usize, &UNUSED);
+            hook_iat(exe, proc_in(imported, c"DirectDrawEnumerateExA"), DirectDrawEnumerateExA as usize, &UNUSED);
         }
     }
     1
+}
+
+/// GOG's DungeonSiege.exe (1.11.1.1486, "AMD RDNA fix") replaces the read of the `maxfps`
+/// setting with a hard-coded `mov dword [esi+0x90], 60.0` plus NOPs, so the game never renders
+/// above 60 fps whatever the monitor. The Steam exe reads the setting (default: no cap). Put
+/// that back: the cap becomes `maxfps=` from the command line, or none. Patched in memory only,
+/// and only if these exact bytes are there.
+const GOG_FPS_CAP_AT: usize = 0x416177;
+const GOG_FPS_CAP: [u8; 24] = [
+    0x8D, 0xBE, 0x90, 0, 0, 0, 0xC7, 0x07, 0x00, 0x00, 0x70, 0x42, // lea edi,[esi+90h]; mov [edi], 60.0f
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+];
+static FPS_CAP_LIFTED: OnceLock<f32> = OnceLock::new();
+
+unsafe fn lift_gog_fps_cap(exe: usize) {
+    if exe != 0x400000 || std::slice::from_raw_parts(GOG_FPS_CAP_AT as *const u8, GOG_FPS_CAP.len()) != GOG_FPS_CAP {
+        return;
+    }
+    let args: Vec<String> = std::env::args().collect();
+    let cap = args.iter().filter_map(|a| a.split_once('=')).filter(|(k, _)| k.eq_ignore_ascii_case("maxfps")).filter_map(|(_, v)| v.trim().parse().ok()).last().unwrap_or(0.0f32);
+    let imm = (GOG_FPS_CAP_AT + 8) as *mut u8;
+    let mut old = 0;
+    VirtualProtect(imm.cast(), 4, PAGE_READWRITE, &mut old);
+    std::ptr::copy_nonoverlapping(cap.to_le_bytes().as_ptr(), imm, 4);
+    VirtualProtect(imm.cast(), 4, old, &mut old);
+    let _ = FPS_CAP_LIFTED.set(cap);
+}
+
+/// The ddraw.dll the game imported, if it isn't us or our stub (logged on first ddraw call).
+static GAME_DDRAW: AtomicUsize = AtomicUsize::new(0);
+
+fn module_path(m: usize) -> String {
+    let mut buf = [0u16; 1024];
+    let n = unsafe { GetModuleFileNameW(m as _, buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    String::from_utf16_lossy(&buf[..n])
+}
+
+// ---------------------------------------------------------------- vanilla (measure-only) mode
+
+/// DESIEGE_EXPERIMENT=vanilla: no fixes at all, the game runs on whatever ddraw it imported;
+/// only the frame counter is hooked so "before" frame rates can be measured the same way.
+fn vanilla() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DESIEGE_EXPERIMENT").unwrap_or_default().split(',').any(|e| e.trim() == "vanilla"))
+}
+
+static VANILLA_CREATE: AtomicUsize = AtomicUsize::new(0);
+orig!(VANILLA_DD_QI: fn(P, *const Guid, *mut P) -> HRESULT);
+orig!(VANILLA_D3D_CREATE_DEVICE: fn(P, *const Guid, P, *mut P) -> HRESULT);
+
+unsafe extern "system" fn vanilla_create_ex(guid: *const Guid, out: *mut P, iid: *const Guid, outer: P) -> HRESULT {
+    let hr = call!(VANILLA_CREATE as fn(*const Guid, *mut P, *const Guid, P) -> HRESULT; guid, out, iid, outer);
+    log!("vanilla: DirectDrawCreateEx via {} -> {} (fps cap lifted: {:?})", module_path(GAME_DDRAW.load(Relaxed)), Hr(hr), FPS_CAP_LIFTED.get());
+    if hr >= 0 {
+        patch(*out, 0, vanilla_dd_qi as usize, &VANILLA_DD_QI);
+    }
+    hr
+}
+
+unsafe extern "system" fn vanilla_dd_qi(this: P, iid: *const Guid, out: *mut P) -> HRESULT {
+    let hr = call!(VANILLA_DD_QI as fn(P, *const Guid, *mut P) -> HRESULT; this, iid, out);
+    if hr >= 0 && iid.as_ref().is_some_and(is_iid_direct3d7) {
+        patch(*out, 4, vanilla_create_device as usize, &VANILLA_D3D_CREATE_DEVICE);
+    }
+    hr
+}
+
+unsafe extern "system" fn vanilla_create_device(this: P, clsid: *const Guid, surf: P, out: *mut P) -> HRESULT {
+    let hr = call!(VANILLA_D3D_CREATE_DEVICE as fn(P, *const Guid, P, *mut P) -> HRESULT; this, clsid, surf, out);
+    log!("vanilla: IDirect3D7::CreateDevice({}) -> {}", G(clsid), Hr(hr));
+    if hr >= 0 {
+        scale::measure_device(*out);
+    }
+    hr
 }
 
 /// Adds `WxH` to the top 32-bit tier. None = already listed (or file layout unexpected).

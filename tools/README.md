@@ -1,13 +1,14 @@
 # Development tools
 
 Scripts used while developing Desiege to drive the game automatically. They're for development
-only (not shipped) and assume a Steam install at the default path and the launcher's runtime
+only (not shipped) and assume a Steam install at the default path (set `GAME_DIR` to use another
+folder, e.g. the GOG one) and the launcher's runtime
 folder (`%APPDATA%\dev.desiege.launcher\runtime`) holding the `desiege.dll` / loader to test.
 Copy a fresh build there first (`build.ps1`, then copy `target\release\desiege.dll`).
 
 | Script         | What it does |
 | -------------- | ------------ |
-| `run_game.ps1` | `run_game.ps1 <seconds> <ui scale> <width> <height> "<snapshot frames>" [game args]`: starts the game through the loader with debug switches (`DESIEGE_UI_SCALE`, `DESIEGE_SNAPSHOT`, `DESIEGE_EXPERIMENT` from `$env:EXP`, extra game args from `$env:EXTRA`), waits, kills it, converts snapshots to PNG. |
+| `run_game.ps1` | `run_game.ps1 <seconds> <ui scale> <width> <height> "<snapshot frames>" [game args]`: starts the game through the loader with debug switches (`DESIEGE_UI_SCALE`, `DESIEGE_SNAPSHOT`, `DESIEGE_EXPERIMENT` from `$env:EXP`, extra game args from `$env:EXTRA`; `EXP=vanilla` runs the unpatched game with only the frame counter, `EXP=vanilla,uncap` also lifts GOG's 60 fps cap), waits, kills it, converts snapshots to PNG. |
 | `focus.ps1`    | Brings the game window to the foreground (needed before synthetic input). |
 | `click.ps1`    | `click.ps1 <x> <y>`: moves the mouse to native screen coordinates and clicks. |
 | `capture.ps1`  | `capture.ps1 <out.png>`: screen capture (works in borderless/windowed; black in exclusive fullscreen; use `DESIEGE_SNAPSHOT` there). |

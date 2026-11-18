@@ -2,7 +2,7 @@
 
 Working checklist for things that need hardware, game versions or testers we don't have yet.
 Everything so far was developed and tested on **Windows 11 + Steam release (v1.11.1.1486) +
-NVIDIA RTX 3070 Ti**.
+NVIDIA RTX 3070 Ti**, plus the GOG release on an AMD Radeon 680M laptop (see GOG below).
 
 ## GPU vendors
 
@@ -37,14 +37,36 @@ driver behave, so each one needs checking on other vendors.
 
 ### GOG
 
-- [ ] Get a GOG copy (planned) and record its exe version and file layout.
-- [ ] Launcher auto-detection: GOG Galaxy registry keys
-      (`HKLM\SOFTWARE\WOW6432Node\GOG.com\Games\<id>` → `path`) and the default install folder.
-- [ ] Compare `DungeonSiege.exe` with the Steam one; if it differs, re-check the addresses our
-      notes rely on (cursor lock pattern, vertex buffer ring, shadow corner sequence).
-- [ ] Where GOG keeps `DungeonSiege.ini` (the resolution fallback for drop-in launches assumes
-      `Documents\Dungeon Siege\`).
-- [ ] Both launch methods, including starting from GOG Galaxy with the drop-in `ddraw.dll`.
+Tested 2026-11-19 on a laptop: Windows 11, AMD Ryzen 7 7735U with Radeon 680M (integrated),
+2880x1620 @ 120 Hz, on AC power. GOG Galaxy install, version tag "1.11.1 AMD RDNA fix".
+
+- [x] Exe version and layout: `DungeonSiege.exe` 1.11.1.1486 (SHA-256 `41F14B14...38A02`),
+      no ASLR. GOG adds its own D3D7 -> D3D9 wrapper as `ddraw.dll` (+ `dxcfg.exe`/`dxcfg.ini`),
+      `goggame-1185868626.*`, and a HIGHDPIAWARE AppCompat layer for the exe (HKLM and HKCU).
+- [x] Launcher auto-detection: `HKLM\SOFTWARE\WOW6432Node\GOG.com\Games\1185868626` -> `path`,
+      then the default GOG folders.
+- [x] GOG's `ddraw.dll` hooks the game's mouse input when it loads, so routing around its
+      exports isn't enough. `desiege-loader` renames the exe's `DDRAW.dll` import to `desiege`
+      in the suspended process (and puts the runtime folder on PATH), so it never loads.
+- [x] The HIGHDPIAWARE layer shims GetCursorPos/SetCursorPos/GetClientRect, so the import slots
+      don't hold user32's addresses; the input hooks now match imports by name.
+- [x] GOG's exe hard-codes a 60 fps cap (`mov [esi+0x90], 60.0` + NOPs at 0x416177 where the
+      Steam exe reads `maxfps`). desiege.dll restores the setting: no cap unless `maxfps=` is given.
+- [x] `DungeonSiege.ini` and saves: `Documents\Dungeon Siege\`, same as Steam.
+- [ ] Compare the cursor/vertex buffer/shadow code addresses with the Steam exe byte for byte
+      (no Steam copy on the test laptop; everything worked in-game, so they likely match).
+- [x] Drop-in `ddraw.dll` method: not possible (the name is GOG's renderer); the launcher says
+      so and points to Inject.
+
+Frame rate, same save (party standing in the first farm), harmonic mean of the last six
+600-frame windows, two runs each:
+
+| Configuration                                                         | Run 1 | Run 2 |
+| --------------------------------------------------------------------- | ----- | ----- |
+| GOG as shipped (GOG renderer, 1024x768 upscaled, 60 fps cap)          | 60.0  | 60.0  |
+| GOG renderer, cap lifted (`DESIEGE_EXPERIMENT=vanilla,uncap`)         | 79.5  | 80.0  |
+| Desiege, 2880x1620 native, UI 200 %, exclusive fullscreen, vsync on   | 120.0 | 120.0 |
+| Same, vsync off (dxwrapper `ForceVsyncMode = 2`)                      | 213.1 | 197.5 |
 
 ### Retail CD (Dungeon Siege 1, Dungeon Siege Gold)
 

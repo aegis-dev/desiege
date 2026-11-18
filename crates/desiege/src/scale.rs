@@ -17,7 +17,7 @@
 // client coordinates). Surfaces the game Locks directly (Bink video into the back buffer, if
 // any) aren't scaled; they show at V size in the corner. Counted in the stats log.
 
-use super::{hook_iat, patch, proc_in, rd, E_FAIL, HRESULT, P};
+use super::{hook_import, patch, rd, E_FAIL, HRESULT, P};
 use std::{
     ffi::c_void,
     sync::{
@@ -677,6 +677,11 @@ orig!(DEV_SET_TEX: fn(P, u32, P) -> HRESULT);
 unsafe extern "system" fn dev_set_texture(this: P, stage: u32, tex: P) -> HRESULT {
     trace(|| format!("SetTexture({stage}, {tex:?})"));
     call!(DEV_SET_TEX as fn(P, u32, P) -> HRESULT; this, stage, shadow::substitute(tex))
+}
+
+/// DESIEGE_EXPERIMENT=vanilla: only the frame counter (for "before" benchmarks).
+pub unsafe fn measure_device(dev: P) {
+    patch(dev, 6, dev_end_scene as usize, &DEV_END_SCENE);
 }
 
 fn scaling() -> bool { active() && RT_MAIN.load(Relaxed) }
@@ -1903,12 +1908,15 @@ pub unsafe fn install_input_hooks() {
         return;
     }
     let exe = GetModuleHandleW(std::ptr::null()) as usize;
-    let user32: Vec<u16> = "user32.dll\0".encode_utf16().collect();
-    let u = GetModuleHandleW(user32.as_ptr()) as usize;
-    hook_iat(exe, proc_in(u, c"GetCursorPos"), get_cursor_pos as usize, &GET_CURSOR_POS);
-    hook_iat(exe, proc_in(u, c"SetCursorPos"), set_cursor_pos as usize, &SET_CURSOR_POS);
-    hook_iat(exe, proc_in(u, c"GetClientRect"), get_client_rect as usize, &GET_CLIENT_RECT);
-    hook_iat(exe, proc_in(u, c"GetSystemMetrics"), get_system_metrics as usize, &GET_SYSTEM_METRICS);
+    let hits = [
+        hook_import(exe, c"user32.dll", c"GetCursorPos", get_cursor_pos as usize, &GET_CURSOR_POS),
+        hook_import(exe, c"user32.dll", c"SetCursorPos", set_cursor_pos as usize, &SET_CURSOR_POS),
+        hook_import(exe, c"user32.dll", c"GetClientRect", get_client_rect as usize, &GET_CLIENT_RECT),
+        hook_import(exe, c"user32.dll", c"GetSystemMetrics", get_system_metrics as usize, &GET_SYSTEM_METRICS),
+    ];
+    if hits.contains(&false) {
+        log!("!! ui scale: some input imports not found (GetCursorPos, SetCursorPos, GetClientRect, GetSystemMetrics): {hits:?}");
+    }
     log!("ui scale: input hooks installed (native {:?})", native());
 }
 

@@ -53,6 +53,21 @@ fn main() -> ExitCode {
 unsafe fn run(dll: &OsStr, exe: &OsStr, game_args: &[std::ffi::OsString]) -> Result<(), String> {
     let last_error = |what: &str| format!("{what} failed: {}", std::io::Error::last_os_error());
 
+    // A foreign ddraw.dll next to the exe (GOG ships its own D3D7->D3D9 wrapper there) would be
+    // loaded as the game's ddraw before we get in. Its DllMain hooks the game's mouse input,
+    // which fights our own mapping, so rerouting its exports isn't enough: it must not load.
+    // The child gets our folder on PATH and, while still suspended, its ddraw import renamed
+    // to our DLL's name (see redirect_ddraw_import), so Windows loads us as its ddraw.dll.
+    let exe_path = std::path::Path::new(exe);
+    let dll_path = std::path::Path::new(dll);
+    let vanilla = std::env::var("DESIEGE_EXPERIMENT").is_ok_and(|e| e.split(',').any(|e| e.trim() == "vanilla"));
+    let redirect = !vanilla && exe_path.parent().is_some_and(|d| d.join("ddraw.dll").is_file());
+    if redirect {
+        let dir = dll_path.parent().ok_or("DLL path has no folder")?;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::set_var("PATH", std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&path))).map_err(|e| e.to_string())?);
+    }
+
     let mut cmdline = wide(OsStr::new(
         &std::iter::once(exe).chain(game_args.iter().map(|a| a.as_os_str())).map(quote).collect::<Vec<_>>().join(" "),
     ));
@@ -64,6 +79,10 @@ unsafe fn run(dll: &OsStr, exe: &OsStr, game_args: &[std::ffi::OsString]) -> Res
     }
 
     let result = (|| {
+        if redirect {
+            let stem = dll_path.file_stem().and_then(|s| s.to_str()).ok_or("DLL name is not valid")?;
+            redirect_ddraw_import(pi.hProcess, exe_path, stem)?;
+        }
         let path = wide(dll);
         let bytes = path.len() * 2;
         let mem = VirtualAllocEx(pi.hProcess, null(), bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -94,4 +113,63 @@ unsafe fn run(dll: &OsStr, exe: &OsStr, game_args: &[std::ffi::OsString]) -> Res
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     result
+}
+
+/// Rewrites the name of the exe's `ddraw.dll` import, in the suspended child's memory, to
+/// `name` (our DLL's file stem; the loader adds ".dll" and finds it on PATH). Runs before the
+/// process's first thread starts, i.e. before any import is loaded. The exe on disk is
+/// untouched. Layout comes from the file on disk; Dungeon Siege has no ASLR (always at its
+/// preferred base), which is checked against the "MZ" header in memory.
+unsafe fn redirect_ddraw_import(process: windows_sys::Win32::Foundation::HANDLE, exe: &std::path::Path, name: &str) -> Result<(), String> {
+    use windows_sys::Win32::System::{Diagnostics::Debug::ReadProcessMemory, Memory::VirtualProtectEx};
+    let file = std::fs::read(exe).map_err(|e| format!("Reading {}: {e}", exe.display()))?;
+    let (base, name_rva, old_len) = find_import_name(&file, "ddraw.dll").ok_or("Could not find the game's ddraw.dll import")?;
+    if name.len() > old_len {
+        return Err(format!("DLL name {name} is longer than {old_len} characters"));
+    }
+    let mut mz = [0u8; 2];
+    if ReadProcessMemory(process, base as _, mz.as_mut_ptr().cast(), 2, std::ptr::null_mut()) == 0 || &mz != b"MZ" {
+        return Err("The game is not loaded at its usual address".into());
+    }
+    let at = (base + name_rva) as *mut std::ffi::c_void;
+    let mut bytes = name.as_bytes().to_vec();
+    bytes.push(0);
+    let mut old = 0;
+    VirtualProtectEx(process, at, bytes.len(), PAGE_READWRITE, &mut old);
+    let ok = WriteProcessMemory(process, at, bytes.as_ptr().cast(), bytes.len(), std::ptr::null_mut());
+    VirtualProtectEx(process, at, bytes.len(), old, &mut old);
+    if ok == 0 {
+        return Err(format!("Redirecting the ddraw import failed: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// PE32: (ImageBase, RVA of the import's name string, its length) for the import named `dll`.
+fn find_import_name(pe: &[u8], dll: &str) -> Option<(usize, usize, usize)> {
+    let u16_at = |o: usize| Some(u16::from_le_bytes(pe.get(o..o + 2)?.try_into().ok()?) as usize);
+    let u32_at = |o: usize| Some(u32::from_le_bytes(pe.get(o..o + 4)?.try_into().ok()?) as usize);
+    let nt = u32_at(0x3C)?;
+    let opt = nt + 24;
+    let base = u32_at(opt + 28)?;
+    let sections = opt + u16_at(nt + 20)?;
+    let file_offset = |rva: usize| {
+        (0..u16_at(nt + 6)?).find_map(|i| {
+            let s = sections + 40 * i;
+            let (vsize, va, raw_size, raw) = (u32_at(s + 8)?, u32_at(s + 12)?, u32_at(s + 16)?, u32_at(s + 20)?);
+            (va..va + vsize.max(raw_size)).contains(&rva).then(|| rva - va + raw)
+        })
+    };
+    let mut desc = file_offset(u32_at(opt + 96 + 8)?)?;
+    loop {
+        let name_rva = u32_at(desc + 12)?;
+        if name_rva == 0 {
+            return None;
+        }
+        let start = file_offset(name_rva)?;
+        let len = pe.get(start..)?.iter().position(|&b| b == 0)?;
+        if pe[start..start + len].eq_ignore_ascii_case(dll.as_bytes()) {
+            return Some((base, name_rva, len));
+        }
+        desc += 20;
+    }
 }

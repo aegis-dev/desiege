@@ -48,8 +48,9 @@ runs, and turning Desiege off gives you the untouched original back.
 ## Requirements
 
 - Windows 10 or 11 (64-bit).
-- **A legally owned copy of Dungeon Siege 1.** The Steam release is detected automatically;
-  other releases (GOG, retail CD) should work if you point the launcher at the game folder.
+- **A legally owned copy of Dungeon Siege 1.** The Steam and GOG releases are detected
+  automatically; other releases (retail CD) should work if you point the launcher at the game
+  folder. See [GOG release](#gog-release) for what differs there.
 - Microsoft Edge WebView2 Runtime (preinstalled on Windows 11 and current Windows 10).
 - Internet access once, if you let the launcher download dxwrapper (strongly recommended; see
   below).
@@ -170,6 +171,24 @@ To uninstall, delete the launcher files and these folders. If you used the “dd
 folder” method, also delete `ddraw.dll` from the game folder (or switch back to *Inject* and
 launch once).
 
+## GOG release
+
+The GOG release has the same game version as Steam (1.11.1.1486), packaged differently:
+
+- **GOG ships its own renderer** as `ddraw.dll` in the game folder (a Direct3D 7 → 9 wrapper,
+  configured with GOG's *DirectX Settings* tool, `dxcfg.exe`). When it loads, it also hooks the
+  game's mouse input. With the *Inject* method, `desiege-loader` changes the game's `ddraw.dll`
+  import to `desiege` in memory, before the game starts, so GOG's wrapper is never loaded and
+  Desiege's tested path (system ddraw + dxwrapper) is used instead. Nothing in the game folder
+  changes, and starting the game from GOG Galaxy still runs it exactly as GOG ships it.
+- **GOG's exe caps the frame rate at 60 fps.** In the code that reads the game's `maxfps`
+  setting, GOG's `DungeonSiege.exe` has a hard-coded 60 instead (the Steam exe reads the
+  setting, which defaults to no cap). Desiege puts the setting back in memory: no cap, or
+  whatever you pass as `maxfps=`.
+- The *ddraw.dll in game folder* launch method isn't available, because that file name is taken
+  by GOG's renderer. Desiege never overwrites it.
+- Saves and settings live in `Documents\Dungeon Siege\`, as on Steam.
+
 ## Troubleshooting
 
 - **First stop: the log.** `%LOCALAPPDATA%\Desiege\desiege.log` records every important decision
@@ -192,6 +211,7 @@ development and bug hunting; set them in the shell you start the launcher from.
 | ------------------------------- | ------ |
 | `DESIEGE_EXPERIMENT=profile`    | Samples the render thread for 10 s once in-game and logs where the time goes, per module and hot address. |
 | `DESIEGE_EXPERIMENT=nodynvb`    | Disables the dynamic vertex buffer fix. |
+| `DESIEGE_EXPERIMENT=vanilla`    | No fixes at all; only counts frames (`fps:` lines), for before/after measurements. Add `,uncap` to also lift GOG's 60 fps cap. |
 | `DESIEGE_SNAPSHOT=300,900`      | Saves the native back buffer at those frame numbers to `snap_<n>.bmp` (exclusive fullscreen can't be screen-captured). |
 | `DESIEGE_TRACE_FRAME=<n>`       | Logs every hooked graphics call of frame `<n>`. |
 | `DESIEGE_DUMP_SHADOWS=1`        | Saves the first few captured shadow textures to `shadow_<n>.bmp`. |
@@ -218,7 +238,7 @@ installed `Logic.dsres` (skipped if the game isn't installed; override the locat
 ## Roadmap
 
 - Prebuilt, signed releases.
-- GOG and retail install detection.
+- Retail install detection.
 - A Tank archive *writer* and a proper mod manager in the launcher.
 - Field-of-view correction for ultrawide screens.
 - Legends of Aranna testing.

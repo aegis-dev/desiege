@@ -112,14 +112,48 @@ fn steam_libraries(vdf: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// GOG's product id for Dungeon Siege 1 (goggame-1185868626.info in the game folder).
+const GOG_GAME_ID: &str = "1185868626";
+
+/// `path` value of a `reg query` listing (`    path    REG_SZ    C:\...`).
+fn reg_value(out: &str, name: &str) -> Option<PathBuf> {
+    out.lines().find_map(|l| {
+        let (key, rest) = l.trim_start().split_once(char::is_whitespace)?;
+        let (kind, value) = rest.trim_start().split_once(char::is_whitespace)?;
+        (key.eq_ignore_ascii_case(name) && kind.starts_with("REG_")).then(|| PathBuf::from(value.trim()))
+    })
+}
+
+/// GOG Galaxy (and the offline installers) register the install folder under
+/// HKLM\SOFTWARE\WOW6432Node\GOG.com\Games\<id>. Fallback: GOG's default folders.
+fn gog_dirs() -> Vec<PathBuf> {
+    let key = format!(r"HKLM\SOFTWARE\WOW6432Node\GOG.com\Games\{GOG_GAME_ID}");
+    let reg = system_tool("reg.exe", &["query".as_ref(), key.as_ref(), "/v".as_ref(), "path".as_ref()]).ok();
+    let mut dirs: Vec<PathBuf> = reg.as_deref().and_then(|o| reg_value(o, "path")).into_iter().collect();
+    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(pf) = std::env::var(var) {
+            dirs.push(PathBuf::from(pf).join(r"GOG Galaxy\Games\Dungeon Siege"));
+        }
+    }
+    dirs.push(r"C:\GOG Games\Dungeon Siege".into());
+    dirs
+}
+
+/// True for a GOG install: GOG ships its own D3D7->D3D9 wrapper as ddraw.dll there, which
+/// desiege.dll bypasses when injected (see crates/desiege DllMain).
+fn is_gog(dir: &Path) -> bool {
+    dir.join(format!("goggame-{GOG_GAME_ID}.info")).is_file()
+}
+
 // ponytail: assumes Steam lives in the default Program Files (x86) folder; read
-// HKCU\Software\Valve\Steam\SteamPath if users report custom installs. GOG detection comes later.
+// HKCU\Software\Valve\Steam\SteamPath if users report custom installs.
 fn detect_game_dir() -> Option<PathBuf> {
     let steam = PathBuf::from(std::env::var("ProgramFiles(x86)").ok()?).join("Steam");
     let vdf = fs::read_to_string(steam.join("steamapps/libraryfolders.vdf")).unwrap_or_default();
     std::iter::once(steam)
         .chain(steam_libraries(&vdf))
         .map(|lib| lib.join(r"steamapps\common\Dungeon Siege 1"))
+        .chain(gog_dirs())
         .find(|dir| dir.join(EXE).is_file())
 }
 
@@ -355,6 +389,9 @@ fn launch(app: tauri::AppHandle, settings: Settings) -> Result<(), String> {
     let stub_state = stub_state(&game_stub);
     let mut cmd = match settings.method {
         Method::GameFolder => {
+            if stub_state == StubState::Foreign && is_gog(&dir) {
+                return Err("The GOG version keeps its own renderer as ddraw.dll in the game folder, so the \"game folder\" method can't be used. Use the Inject method (Desiege bypasses GOG's renderer there).".into());
+            }
             if stub_state == StubState::Foreign {
                 return Err("The game folder already has a ddraw.dll from something else (another mod?). Remove it, or use the Inject method.".into());
             }
@@ -367,6 +404,8 @@ fn launch(app: tauri::AppHandle, settings: Settings) -> Result<(), String> {
             match stub_state {
                 // Leaving it would load desiege.dll twice.
                 StubState::Ours => fs::remove_file(&game_stub).map_err(|e| format!("Could not remove our ddraw.dll from the game folder: {e}"))?,
+                // GOG's own wrapper: left in place; desiege.dll reroutes the game around it.
+                StubState::Foreign if is_gog(&dir) => {}
                 StubState::Foreign => return Err("The game folder has a ddraw.dll from something else (another mod?), which would bypass Desiege. Remove it to use Inject.".into()),
                 StubState::Absent => {}
             }
@@ -452,6 +491,13 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_gog_registry_path() {
+        let out = "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\GOG.com\\Games\\1185868626\r\n    path    REG_SZ    C:\\Program Files\\GOG Galaxy\\Games\\Dungeon Siege\r\n\r\n";
+        assert_eq!(reg_value(out, "path"), Some(PathBuf::from(r"C:\Program Files\GOG Galaxy\Games\Dungeon Siege")));
+        assert_eq!(reg_value(out, "exe"), None);
+    }
 
     #[test]
     fn parses_steam_libraries() {
