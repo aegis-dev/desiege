@@ -68,12 +68,12 @@ extern "C" fn api_on_frame(f: FrameFn, user: *mut c_void) {
 extern "C" fn api_draw_text(x: i32, y: i32, text: *const c_char, argb: u32, size: i32, align: u32) {
     let text: Vec<u16> = unsafe { str_arg(text) }.encode_utf16().collect();
     if !text.is_empty() {
-        crate::scale::overlay::queue(crate::scale::overlay::Item { x, y, text, argb, size, align });
+        crate::overlay::queue(crate::overlay::Item { x, y, text, argb, size, align });
     }
 }
 
 extern "C" fn api_screen_size(w: *mut i32, h: *mut i32) {
-    let (sw, sh) = crate::scale::gpu::screen();
+    let (sw, sh) = crate::gpu::screen();
     unsafe {
         if !w.is_null() { *w = sw as i32 }
         if !h.is_null() { *h = sh as i32 }

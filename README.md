@@ -239,9 +239,19 @@ development and bug hunting; set them in the shell you start the launcher from.
 ```
 launcher/            Tauri launcher: Rust backend (src/main.rs) and plain HTML/JS UI (ui/)
 crates/desiege/      desiege.dll (all in-game fixes) and desiege-loader.exe
-  src/lib.rs         DirectDraw/D3D7 hooks, VRAM cap, system_detail.gas redirect
-  src/scale.rs       resolution decoupling, cursor overlay, GPU shadows, dynamic VBs, input
+  src/lib.rs         DLL entry, ddraw exports, patch helpers, IDirectDraw7/IDirect3D7 hooks, VRAM cap
+  src/surface.rs     IDirectDrawSurface7 hooks (Blt, Lock, Flip), dispatching to the features
+  src/device.rs      IDirect3DDevice7 hooks (viewports, clears, draws, render targets)
+  src/system_detail.rs  system_detail.gas redirect (resolution, vendor flags)
+  src/scale.rs       resolution decoupling: virtual/native mapping, lock emulation
+  src/input.rs       mouse and window metrics for resolution decoupling
+  src/shadow.rs      GPU character shadows (+ soft edges)
+  src/cursor.rs      cursor overlay
+  src/dynvb.rs       dynamic vertex buffer mirrors
   src/gfx.rs         graphics options: texture filtering, detail flags, 32-bit formats
+  src/overlay.rs     code mods' overlay text; src/code_mods.rs loads code mods
+  src/gpu.rs         our own surfaces, quads and render-state save/restore
+  src/debug.rs       stats, one-frame trace, snapshots, experiments
   src/profile.rs     built-in sampling profiler (debug)
   examples/          selfcheck (smoke test without the game) and rtsize (D3D7 size limit test)
 crates/ddraw-stub/   the optional drop-in ddraw.dll

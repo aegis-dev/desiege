@@ -1,8 +1,18 @@
-//! desiege.dll: all in-process fixes for Dungeon Siege. Currently:
-//! - VRAM cap: modern cards report >2 GB, which the game reads as negative (see VRAM_CAP)
-//! - system_detail.gas redirect: adds the launch resolution without editing game files
-//! - loads dxwrapper (D3D7 -> D3D9) so resolutions above 2048 px wide work
-//! - logs DirectDraw7 / Direct3D7 calls and HRESULTs to `%LOCALAPPDATA%\Desiege\desiege.log`
+//! desiege.dll: all in-process fixes for Dungeon Siege. This file: the DLL entry, the ddraw
+//! exports, vtable/import patching helpers and the IDirectDraw7 / IDirect3D7 hooks (VRAM cap,
+//! display modes, device creation); it loads dxwrapper (D3D7 -> D3D9) so resolutions above
+//! 2048 px wide work, and logs to `%LOCALAPPDATA%\Desiege\desiege.log`.
+//!
+//! Interface hooks, which dispatch the game's calls to the features:
+//! - `surface`: IDirectDrawSurface7 (Blt, Lock, Flip) of the primary chain
+//! - `device`: IDirect3DDevice7 (viewports, clears, draws, render targets, textures)
+//! - `system_detail`: CreateFileA, serving a patched copy of the hardware table
+//!
+//! Features: `scale` (resolution decoupling: UI scale, borderless) with `input` (mouse and
+//! window metrics), `shadow` (GPU character shadows), `cursor` (cursor overlay), `dynvb`
+//! (dynamic vertex buffer mirrors), `gfx` (graphics options), `overlay` + `code_mods` (code mods).
+//! Shared: `gpu` (our own surfaces, quads, state save/restore), `debug` (stats, trace,
+//! snapshots, experiments), `profile` (sampling profiler).
 //!
 //! Two ways in:
 //! - injected by `desiege-loader.exe` (game folder untouched); DllMain then reroutes the
@@ -18,7 +28,7 @@
 #![allow(non_snake_case, clippy::missing_safety_doc, function_casts_as_integer)]
 
 use std::{
-    ffi::{c_char, c_void, CStr, CString},
+    ffi::{c_char, c_void, CStr},
     fmt,
     fs::{self, File},
     io::Write,
@@ -109,7 +119,7 @@ unsafe fn real_proc(name: &CStr) -> usize {
         if lib != 0 {
             resolve_forwards(lib);
         }
-        scale::install_input_hooks();
+        input::install_hooks();
         code_mods::load_all();
         lib
     });
@@ -183,6 +193,12 @@ unsafe fn patch(obj: P, idx: usize, hook: usize, orig: &AtomicUsize) {
     write_ptr(slot, hook);
 }
 
+/// COM method `idx` of `obj`, as the function type `F` (read from the vtable each call, so a
+/// method we hooked comes back as our hook).
+unsafe fn method<F>(obj: P, idx: usize) -> F {
+    std::mem::transmute_copy(&*(*(obj as *const *const usize)).add(idx))
+}
+
 unsafe fn write_ptr(slot: *mut usize, value: usize) {
     let mut old = 0;
     VirtualProtect(slot.cast(), 4, PAGE_READWRITE, &mut old);
@@ -240,8 +256,8 @@ unsafe fn hook_import(module: usize, dll: &CStr, func: &CStr, hook: usize, orig:
 /// Declares the static holding a hook's original method pointer (signature is documentation;
 /// `call!` repeats it when transmuting).
 macro_rules! orig {
-    ($name:ident : fn($($t:ty),*) -> $r:ty) => {
-        static $name: AtomicUsize = AtomicUsize::new(0);
+    ($vis:vis $name:ident : fn($($t:ty),*) -> $r:ty) => {
+        $vis static $name: AtomicUsize = AtomicUsize::new(0);
     };
 }
 macro_rules! call {
@@ -249,13 +265,6 @@ macro_rules! call {
         std::mem::transmute::<usize, unsafe extern "system" fn($($t),*) -> $r>($o.load(Relaxed))($($a),*)
     };
 }
-
-// ---------------------------------------------------------------- system_detail.gas redirect
-//
-// system_detail.gas maps VRAM tier x color depth to allowed resolutions, maxing at 1024x768;
-// anything else triggers "requested display mode ... is unsupported". Rather than edit the
-// game's file, the game's CreateFileA is hooked and opens of system_detail.gas are redirected
-// to a copy in %LOCALAPPDATA%\Desiege with the command-line width x height added.
 
 #[no_mangle]
 pub unsafe extern "system" fn DllMain(module: P, reason: u32, _: P) -> i32 {
@@ -287,9 +296,9 @@ pub unsafe extern "system" fn DllMain(module: P, reason: u32, _: P) -> i32 {
         lift_gog_fps_cap(exe);
         let k32: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
         let target = proc_in(GetModuleHandleW(k32.as_ptr()) as usize, c"CreateFileA");
-        hook_iat(exe, target, create_file_a as usize, &CREATE_FILE_A);
+        hook_iat(exe, target, system_detail::create_file_a as usize, &system_detail::CREATE_FILE_A);
         let target = proc_in(GetModuleHandleW(k32.as_ptr()) as usize, c"FindFirstFileA");
-        hook_iat(exe, target, find_first_file_a as usize, &FIND_FIRST_FILE_A);
+        hook_iat(exe, target, system_detail::find_first_file_a as usize, &system_detail::FIND_FIRST_FILE_A);
         if !ours {
             static UNUSED: AtomicUsize = AtomicUsize::new(0);
             hook_iat(exe, proc_in(imported, c"DirectDrawCreateEx"), DirectDrawCreateEx as usize, &UNUSED);
@@ -368,119 +377,9 @@ unsafe extern "system" fn vanilla_create_device(this: P, clsid: *const Guid, sur
     let hr = call!(VANILLA_D3D_CREATE_DEVICE as fn(P, *const Guid, P, *mut P) -> HRESULT; this, clsid, surf, out);
     log!("vanilla: IDirect3D7::CreateDevice({}) -> {}", G(clsid), Hr(hr));
     if hr >= 0 {
-        scale::measure_device(*out);
+        device::measure(*out);
     }
     hr
-}
-
-/// Adds `WxH` to the top 32-bit tier. None = already listed (or file layout unexpected).
-// ponytail: only touches [64M32B], the tier any modern card lands in (with the VRAM cap),
-// since the launcher always passes bpp=32.
-fn add_resolution(gas: &str, w: u32, h: u32) -> Option<String> {
-    let tier = gas.find("\t[64M32B]")?;
-    let tier_end = gas[tier + 1..].find("\n\t[").map_or(gas.len(), |i| tier + 1 + i);
-    let block = &gas[tier..tier_end];
-    if block.contains(&format!("[{w}x{h}]")) {
-        return None;
-    }
-    let res = block.find("[resolutions]")?;
-    let open = tier + res + block[res..].find('{')? + 1;
-    Some(format!("{}\n\t\t\t[{w}x{h}]\t{{ max_back_buffers = 2; }}{}", &gas[..open], &gas[open..]))
-}
-
-/// `width=`/`height=` from `key=value` items (command-line args or ini lines; spaces around
-/// `=` allowed, as in DungeonSiege.ini). Last one wins, like the game's own parsing.
-fn find_resolution<'a>(items: impl Iterator<Item = &'a str>) -> Option<(u32, u32)> {
-    let (mut w, mut h) = (None, None);
-    for item in items {
-        let Some((k, v)) = item.split_once('=') else { continue };
-        match k.trim().to_ascii_lowercase().as_str() {
-            "width" => w = v.trim().parse().ok(),
-            "height" => h = v.trim().parse().ok(),
-            _ => {}
-        }
-    }
-    Some((w?, h?))
-}
-
-/// The launcher passes width=/height= on the command line. A Steam launch may not, so fall
-/// back to what the game itself will use: Documents\Dungeon Siege\DungeonSiege.ini.
-// ponytail: assumes Documents is %USERPROFILE%\Documents; use SHGetKnownFolderPath if a user
-// with a relocated Documents folder reports the "unsupported mode" warning on Steam launches.
-fn launch_resolution() -> Option<(u32, u32)> {
-    let args: Vec<String> = std::env::args().collect();
-    find_resolution(args.iter().map(String::as_str)).or_else(|| {
-        let ini = PathBuf::from(std::env::var_os("USERPROFILE")?).join(r"Documents\Dungeon Siege\DungeonSiege.ini");
-        find_resolution(fs::read_to_string(ini).ok()?.lines())
-    })
-}
-
-/// Sets `no_flip = false` for every GPU vendor. With no_flip (the 2002 setting for nVidia
-/// and others) the game presents each frame by Blt-copying the whole back buffer to the front
-/// buffer, which under D3D9 translation is a full-screen GPU->CPU->GPU round trip; that halved
-/// the frame rate (55 -> 112 fps at 2560x1440). Flipping is free.
-fn enable_flip(gas: &str) -> String {
-    gas.lines()
-        .map(|l| {
-            let t = l.trim_start();
-            if t.starts_with("b no_flip") && t.contains("true") {
-                l.replacen("true", "false", 1)
-            } else {
-                l.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + if gas.ends_with('\n') { "\n" } else { "" }
-}
-
-/// Writes the patched copy; None means "open the original".
-fn patched_gas(original: &str) -> Option<CString> {
-    let text = fs::read_to_string(original).ok()?;
-    let with_res = launch_resolution().and_then(|(w, h)| add_resolution(&text, w, h)).unwrap_or_else(|| text.clone());
-    let patched = gfx::patch_gas(&enable_flip(&with_res), gfx::config());
-    if patched == text {
-        return None;
-    }
-    let dir = PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Desiege");
-    fs::create_dir_all(&dir).ok()?;
-    let path = dir.join("system_detail.gas");
-    fs::write(&path, patched).ok()?;
-    // ponytail: CreateFileA takes an ANSI path; a non-ASCII profile path just falls back to
-    // the original file (warning comes back, nothing breaks).
-    CString::new(path.to_str().filter(|s| s.is_ascii())?).ok()
-}
-
-orig!(CREATE_FILE_A: fn(*const c_char, u32, u32, P, u32, u32, P) -> P);
-
-unsafe extern "system" fn create_file_a(
-    name: *const c_char, access: u32, share: u32, sa: P, disposition: u32, flags: u32, template: P,
-) -> P {
-    let mut name = name;
-    if !name.is_null() && CStr::from_ptr(name).to_bytes().to_ascii_lowercase().ends_with(b"system_detail.gas") {
-        static REDIRECT: OnceLock<Option<CString>> = OnceLock::new();
-        let original = CStr::from_ptr(name).to_string_lossy().into_owned();
-        let redirect = REDIRECT.get_or_init(|| patched_gas(&original));
-        log!("CreateFileA({original}) -> {}", redirect.as_ref().map_or("original".into(), |p| p.to_string_lossy()));
-        if let Some(p) = redirect {
-            name = p.as_ptr();
-        }
-    } else if !name.is_null() {
-        // ponytail: logs every file the game opens (it opens few: tanks are memory-mapped).
-        // Useful while mapping out mod loading; gate it behind a setting if it gets noisy.
-        log!("CreateFileA({})", cstr(name));
-    }
-    call!(CREATE_FILE_A as fn(*const c_char, u32, u32, P, u32, u32, P) -> P;
-        name, access, share, sa, disposition, flags, template)
-}
-
-orig!(FIND_FIRST_FILE_A: fn(*const c_char, P) -> P);
-
-/// Logged to see which folders the game scans for .dsres / .dsmod / .dsmap tanks.
-unsafe extern "system" fn find_first_file_a(pattern: *const c_char, data: P) -> P {
-    let h = call!(FIND_FIRST_FILE_A as fn(*const c_char, P) -> P; pattern, data);
-    log!("FindFirstFileA({}) -> {}", cstr(pattern), if h as isize == -1 { "none" } else { "found" });
-    h
 }
 
 // ---------------------------------------------------------------- exports
@@ -537,7 +436,25 @@ unsafe fn hook_ddraw7(dd: P) {
     patch(dd, 20, dd_set_coop as usize, &DD_SET_COOP);
     patch(dd, 21, dd_set_mode as usize, &DD_SET_MODE);
     patch(dd, 23, dd_vidmem as usize, &DD_VIDMEM);
+    patch(dd, 27, dd_get_device_identifier as usize, &DD_GET_ID);
+    DDRAW.store(dd as usize, Relaxed);
     scale::hook_ddraw7(dd);
+}
+
+/// Latest IDirectDraw7 (the game recreates it on mode changes); our own textures (cursor,
+/// overlay text, shadow targets) are created on it and die with it.
+static DDRAW: AtomicUsize = AtomicUsize::new(0);
+
+// DDDEVICEIDENTIFIER2: szDriver[512], szDescription[512], liDriverVersion u64, then
+// dwVendorId @1032, dwDeviceId @1036. system_detail.gas keys per-vendor quirks off these.
+orig!(DD_GET_ID: fn(P, *mut c_void, u32) -> HRESULT);
+unsafe extern "system" fn dd_get_device_identifier(this: P, id: *mut c_void, flags: u32) -> HRESULT {
+    let hr = call!(DD_GET_ID as fn(P, *mut c_void, u32) -> HRESULT; this, id, flags);
+    if hr >= 0 && !id.is_null() {
+        let desc = CStr::from_ptr((id as *const u8).add(512).cast()).to_string_lossy();
+        log!("IDirectDraw7::GetDeviceIdentifier -> vendor=0x{:04X} device=0x{:04X} '{desc}'", rd(id, 1032), rd(id, 1036));
+    }
+    hr
 }
 
 /// {F5049E77-4861-11D2-A407-00A0C90629A8}
@@ -561,6 +478,7 @@ unsafe extern "system" fn dd_create_surface(this: P, desc: *mut c_void, out: *mu
     let mut copy = [0u8; 124];
     let main = !desc.is_null() && {
         std::ptr::copy_nonoverlapping(desc as *const u8, copy.as_mut_ptr(), 124);
+        shadow::experiment_rt_textures(copy.as_mut_ptr().cast());
         scale::adjust_create_surface(copy.as_mut_ptr().cast())
     };
     // The copy equals the game's desc unless scale adjusted it; always pass it.
@@ -649,7 +567,7 @@ unsafe extern "system" fn dd_set_coop(this: P, hwnd: P, flags: u32) -> HRESULT {
     log!("IDirectDraw7::SetCooperativeLevel(hwnd={hwnd:?}, flags=0x{flags:X}) -> {}", Hr(hr));
     const DDSCL_EXCLUSIVE: u32 = 0x10;
     if hr >= 0 && flags & DDSCL_EXCLUSIVE != 0 {
-        scale::game_window(hwnd);
+        input::game_window(hwnd);
     }
     hr
 }
@@ -685,7 +603,7 @@ unsafe fn hook_d3d7(d3d: P) {
     patch(d3d, 3, d3d_enum_devices as usize, &D3D_ENUM_DEVICES);
     patch(d3d, 4, d3d_create_device as usize, &D3D_CREATE_DEVICE);
     patch(d3d, 6, d3d_enum_zbuf as usize, &D3D_ENUM_ZBUF);
-    scale::dynvb::hook_d3d7(d3d);
+    dynvb::hook_d3d7(d3d);
 }
 
 type DevCb = unsafe extern "system" fn(*const c_char, *const c_char, *mut c_void, P) -> HRESULT;
@@ -707,7 +625,7 @@ unsafe extern "system" fn d3d_create_device(this: P, clsid: *const Guid, surf: P
     let hr = call!(D3D_CREATE_DEVICE as fn(P, *const Guid, P, *mut P) -> HRESULT; this, clsid, surf, out);
     log!("IDirect3D7::CreateDevice({}) -> {}", G(clsid), Hr(hr));
     if hr >= 0 {
-        scale::created_device(*out, surf);
+        device::created(*out, surf);
         gfx::hook_device(*out);
     }
     hr
@@ -740,40 +658,21 @@ unsafe extern "system" fn d3d_enum_zbuf(this: P, dev: *const Guid, cb: ZCb, ctx:
 }
 
 // After the macros above: macro_rules are only visible to modules declared after them.
-mod scale;
-mod profile;
+// Interface hooks (entry points from the game's calls):
+mod device;
+mod surface;
+mod system_detail;
+// Features:
+mod scale; // resolution decoupling (UI scale, borderless)
+mod input; // mouse and window metrics for resolution decoupling
+mod shadow; // GPU character shadows
+mod cursor; // cursor overlay
+mod dynvb; // dynamic vertex buffer mirrors
+mod gfx; // graphics options
+mod overlay; // code mods' overlay text
 mod code_mods;
-mod gfx;
+// Shared:
+mod gpu; // our own textures and quads
+mod debug;
+mod profile;
 
-#[cfg(test)]
-mod tests {
-    use super::{add_resolution, find_resolution};
-
-    #[test]
-    fn finds_resolution_in_args_and_ini() {
-        let args = ["C:\\game\\DungeonSiege.exe", "width=2560", "height=1440", "bpp=32"];
-        assert_eq!(find_resolution(args.into_iter()), Some((2560, 1440)));
-        let ini = "driver_description = Primary\nwidth = 1920\nheight = 1080\n[multiplayer]\ngun_server = x";
-        assert_eq!(find_resolution(ini.lines()), Some((1920, 1080)));
-        assert_eq!(find_resolution(["nointro=true"].into_iter()), None);
-    }
-
-    #[test]
-    fn enables_flip() {
-        let gas = "\t[vendor*]\n\t{\n\t\tvendor\t= \"nVidia\";\n\t\tb no_flip\t\t\t\t\t= true;\n\t\tb buffers_frames\t= true;\n\t}\n";
-        let out = super::enable_flip(gas);
-        assert_eq!(out, gas.replace("no_flip\t\t\t\t\t= true", "no_flip\t\t\t\t\t= false"));
-        assert_eq!(super::enable_flip(&out), out);
-    }
-
-    #[test]
-    fn adds_resolution_to_top_tier_once() {
-        let gas = "[system_detail]\n{\n\t[32M16B]\n\t{\n\t\t[resolutions]\n\t\t{\n\t\t\t[800x600]\t{ max_back_buffers = 2; }\n\t\t}\n\t}\n\t[64M32B]\n\t{\n\t\tdetail\t\t\t= 4;\n\t\t[resolutions]\n\t\t{\n\t\t\t[1024x768]\t{ max_back_buffers = 2; }\n\t\t}\n\t}\n\t[64M16B]\n\t{\n\t}\n}\n";
-        let out = add_resolution(gas, 2560, 1440).unwrap();
-        let tier = &out[out.find("[64M32B]").unwrap()..out.find("[64M16B]").unwrap()];
-        assert!(tier.contains("\t\t{\n\t\t\t[2560x1440]\t{ max_back_buffers = 2; }\n\t\t\t[1024x768]"));
-        assert_eq!(out.matches("2560x1440").count(), 1);
-        assert_eq!(add_resolution(&out, 2560, 1440), None);
-        assert_eq!(add_resolution(gas, 1024, 768), None);
-    }
-}

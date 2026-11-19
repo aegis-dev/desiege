@@ -144,7 +144,7 @@ unsafe extern "system" fn dev_enum_tex(this: P, cb: FmtCb, ctx: P) -> HRESULT {
     }
     let u = |f: &[u8; 32], o: usize| u32::from_le_bytes(f[o..o + 4].try_into().unwrap());
     let rgb32 = |f: &[u8; 32]| u(f, 4) & DDPF_RGB != 0 && u(f, 4) & DDPF_FOURCC == 0 && u(f, 12) == 32;
-    let has32 = all.0.iter().any(|f| rgb32(f) && u(f, 4) & DDPF_ALPHAPIXELS != 0) && all.0.iter().any(|f| rgb32(f));
+    let has32 = all.0.iter().any(|f| rgb32(f) && u(f, 4) & DDPF_ALPHAPIXELS != 0) && all.0.iter().any(rgb32);
     let hide = config().hq_formats && has32;
     static LOGGED: AtomicUsize = AtomicUsize::new(0);
     let log_it = LOGGED.fetch_add(1, Relaxed) < 2;
