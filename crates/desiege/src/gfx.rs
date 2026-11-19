@@ -47,6 +47,8 @@ pub struct Config {
     pub lights_debug: bool,
     /// Extra factor for the light that follows the party (it's white and strong).
     pub lights_party: f32,
+    /// Contrast-adaptive sharpening of the 3D image, 0 = off .. 1 = strongest (ao.rs).
+    pub sharpen: f32,
     /// Temporary: virtual-key code that toggles AO + per-pixel lights in-game (0 = none; Insert,
     /// which the game leaves unbound; F9 is its quick save).
     pub toggle_key: u32,
@@ -57,7 +59,7 @@ impl Default for Config {
         Config {
             filter: 16, hq_formats: true, max_detail: true, soft_shadows: true, msaa: 0,
             ao: 0, ao_radius: 1.0, ao_strength: 1.3, ao_fade_start: 25.0, ao_fade_end: 40.0, ao_debug: false, lights_probe: 0,
-            lights: 0, lights_strength: 0.3, lights_debug: false, lights_party: 0.4, toggle_key: 0x2D,
+            lights: 0, lights_strength: 0.3, lights_debug: false, lights_party: 0.4, sharpen: 0.0, toggle_key: 0x2D,
         }
     }
 }
@@ -86,6 +88,7 @@ impl Config {
                 "lights_strength" => self.lights_strength = v.parse().unwrap_or(self.lights_strength),
                 "lights_debug" => self.lights_debug = flag,
                 "lights_party" => self.lights_party = v.parse().unwrap_or(self.lights_party),
+                "sharpen" => self.sharpen = v.parse::<f32>().unwrap_or(self.sharpen).clamp(0.0, 1.0),
                 "toggle_key" => self.toggle_key = v.strip_prefix("0x").map_or_else(|| v.parse().ok(), |h| u32::from_str_radix(h, 16).ok()).unwrap_or(self.toggle_key),
                 _ => {}
             }

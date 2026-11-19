@@ -46,6 +46,7 @@ const CREATE_STATE_BLOCK: usize = 59;
 const SET_TEXTURE: usize = 65;
 const SET_SAMPLER_STATE: usize = 69;
 const DRAW_PRIMITIVE_UP: usize = 83;
+const STRETCH_RECT: usize = 34;
 const SET_FVF: usize = 89;
 const CREATE_VERTEX_SHADER: usize = 91;
 const SET_VERTEX_SHADER: usize = 92;
@@ -57,8 +58,13 @@ const GET_SURFACE_LEVEL: usize = 18;
 const SB_CAPTURE: usize = 4;
 const SB_APPLY: usize = 5;
 
-/// Anything that needs the pass between world and UI (AO, per-pixel lights).
+/// Anything that needs the pass between world and UI (AO, per-pixel lights, sharpening).
 pub fn enabled() -> bool {
+    let c = gfx::config();
+    (c.ao > 0 || c.lights > 0 || c.sharpen > 0.0) && !FAILED.load(Relaxed)
+}
+/// Effects that need the depth buffer as a texture (sharpening doesn't).
+fn depth_wanted() -> bool {
     let c = gfx::config();
     (c.ao > 0 || c.lights > 0) && !FAILED.load(Relaxed)
 }
@@ -82,7 +88,7 @@ static LABEL_UNTIL: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 pub unsafe fn toggle_frame() {
     use windows_sys::Win32::UI::{Input::KeyboardAndMouse::GetAsyncKeyState, WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId}};
     let c = gfx::config();
-    if c.toggle_key == 0 || (c.ao == 0 && c.lights == 0) {
+    if c.toggle_key == 0 || !enabled() {
         return;
     }
     static WAS_DOWN: AtomicBool = AtomicBool::new(false);
@@ -101,6 +107,7 @@ pub unsafe fn toggle_frame() {
         let mut parts = Vec::new();
         if c.ao > 0 { parts.push("ambient occlusion") }
         if c.lights > 0 { parts.push("per-pixel lights") }
+        if c.sharpen > 0.0 { parts.push("sharpening") }
         let text = if SHOWN.load(Relaxed) { format!("NEW: {}", parts.join(" + ")) } else { "ORIGINAL".to_string() };
         let (w, _) = crate::gpu::screen();
         let size = (28.0 * crate::scale::ui_scale_factor()) as i32;
@@ -116,8 +123,8 @@ static DEPTH: Mutex<Option<(usize, usize, u32, u32)>> = Mutex::new(None);
 
 /// CreateDepthStencilSurface replacement. Some = handled (an INTZ texture's surface).
 pub unsafe fn create_depth(dev: P, w: u32, h: u32, fmt: u32, ms: u32, out: *mut P) -> Option<HRESULT> {
-    if !enabled() || ms != 0 || !(fmt == FMT_D24S8 || fmt == FMT_D24X8) || out.is_null() {
-        if enabled() && ms != 0 {
+    if !depth_wanted() || ms != 0 || !(fmt == FMT_D24S8 || fmt == FMT_D24X8) || out.is_null() {
+        if depth_wanted() && ms != 0 {
             log!("ao: depth is multisampled (MSAA on); AO needs it single-sampled, so it stays off");
         }
         return None;
@@ -295,6 +302,28 @@ float4 ps_light(float2 uv0 : TEXCOORD0) : COLOR {
     return float4(sum * lcount.y * fadeOut, 1);
 }
 
+// Contrast-adaptive sharpening (after AMD FidelityFX CAS): sharpen each pixel against its
+// 4 neighbours, by an amount that shrinks where local contrast is already high, so edges don't
+// ring and flat, blurry texture gets the most.
+// Taps are `cas.y` pixels apart (1 at 1080p, more at higher resolutions, where the game's
+// magnified textures are blurred over more pixels), read with bilinear filtering.
+float4 cas : register(c40); // x = sharpness 0..1, y = tap distance in pixels
+sampler2D colorTex : register(s0);
+float3 px(float2 uv, float2 o) { return tex2Dlod(colorTex, float4(uv + o * cas.y * rt.xy, 0, 0)).rgb; }
+float4 ps_cas(float2 uv : TEXCOORD0) : COLOR {
+    float3 a = px(uv, float2(-1, -1)), b = px(uv, float2(0, -1)), c = px(uv, float2(1, -1));
+    float3 d = px(uv, float2(-1, 0)), e = px(uv, float2(0, 0)), f = px(uv, float2(1, 0));
+    float3 g = px(uv, float2(-1, 1)), h = px(uv, float2(0, 1)), i = px(uv, float2(1, 1));
+    float3 mn = min(min(min(d, e), min(f, b)), h);
+    mn += min(mn, min(min(a, c), min(g, i)));
+    float3 mx = max(max(max(d, e), max(f, b)), h);
+    mx += max(mx, max(max(a, c), max(g, i)));
+    float3 amp = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-5)));
+    float3 w = amp * (-1.0 / lerp(8.0, 5.0, cas.x));
+    float3 o = (b * w + d * w + f * w + h * w + e) / (1.0 + 4.0 * w);
+    return float4(saturate(o), 1);
+}
+
 // Full resolution: 4x4 AO texels (half size) around the pixel, weighted by depth similarity,
 // which also undoes the 4x4 rotation pattern and upsamples without halos at silhouettes.
 float4 ps_blur(float2 uv : TEXCOORD0) : COLOR {
@@ -347,10 +376,10 @@ fn cache_path() -> Option<std::path::PathBuf> {
     }
     Some(std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Desiege").join(format!("ao-{h:016x}.bin")))
 }
-fn load_cache() -> Option<[Vec<u32>; 4]> {
+fn load_cache() -> Option<[Vec<u32>; 5]> {
     let bytes = std::fs::read(cache_path()?).ok()?;
     let words: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
-    let mut out: [Vec<u32>; 4] = Default::default();
+    let mut out: [Vec<u32>; 5] = Default::default();
     let mut i = 0;
     for o in &mut out {
         let n = *words.get(i)? as usize;
@@ -359,7 +388,7 @@ fn load_cache() -> Option<[Vec<u32>; 4]> {
     }
     Some(out)
 }
-fn save_cache(c: &[Vec<u32>; 4]) {
+fn save_cache(c: &[Vec<u32>; 5]) {
     let Some(path) = cache_path() else { return };
     let mut bytes = Vec::new();
     for v in c {
@@ -375,9 +404,10 @@ struct Gpu {
     ps_ao: usize,
     ps_blur: usize,
     ps_light: usize,
+    ps_cas: usize,
     state: usize,
-    /// AO render target texture + its surface, and their size.
-    target: Option<(usize, usize, u32, u32)>,
+    /// Render-target textures by `Slot`.
+    targets: [Option<Target>; 2],
     /// References our objects hold on the device (see d3d9::dev9_release).
     refs: u32,
 }
@@ -403,11 +433,11 @@ unsafe fn setup(dev: P) -> Result<Gpu, String> {
         return Err("d3dcompiler_47.dll not found".into());
     }
     let t0 = std::time::Instant::now();
-    let [vs, ps_ao, ps_blur, ps_light] = match load_cache() {
+    let [vs, ps_ao, ps_blur, ps_light, ps_cas] = match load_cache() {
         Some(c) => c,
         None => {
             let f: Compile = std::mem::transmute(GetProcAddress(lib, c"D3DCompile".as_ptr().cast()).ok_or("D3DCompile missing")?);
-            let c = [compile(f, "vs_main", "vs_3_0")?, compile(f, "ps_ao", "ps_3_0")?, compile(f, "ps_blur", "ps_3_0")?, compile(f, "ps_light", "ps_3_0")?];
+            let c = [compile(f, "vs_main", "vs_3_0")?, compile(f, "ps_ao", "ps_3_0")?, compile(f, "ps_blur", "ps_3_0")?, compile(f, "ps_light", "ps_3_0")?, compile(f, "ps_cas", "ps_3_0")?];
             save_cache(&c);
             c
         }
@@ -415,7 +445,7 @@ unsafe fn setup(dev: P) -> Result<Gpu, String> {
     let before = d3d9::refcount(dev);
     let create_vs: unsafe extern "system" fn(P, *const u32, *mut P) -> HRESULT = method(dev, CREATE_VERTEX_SHADER);
     let create_ps: unsafe extern "system" fn(P, *const u32, *mut P) -> HRESULT = method(dev, CREATE_PIXEL_SHADER);
-    let mut g = Gpu { dev: dev as usize, vs: 0, ps_ao: 0, ps_blur: 0, ps_light: 0, state: 0, target: None, refs: 0 };
+    let mut g = Gpu { dev: dev as usize, vs: 0, ps_ao: 0, ps_blur: 0, ps_light: 0, ps_cas: 0, state: 0, targets: [None; 2], refs: 0 };
     let mut p = std::ptr::null_mut();
     if create_vs(dev, vs.as_ptr(), &mut p) < 0 { return Err("CreateVertexShader failed".into()) }
     g.vs = p as usize;
@@ -425,6 +455,8 @@ unsafe fn setup(dev: P) -> Result<Gpu, String> {
     g.ps_blur = p as usize;
     if create_ps(dev, ps_light.as_ptr(), &mut p) < 0 { return Err("CreatePixelShader (lights) failed".into()) }
     g.ps_light = p as usize;
+    if create_ps(dev, ps_cas.as_ptr(), &mut p) < 0 { return Err("CreatePixelShader (sharpen) failed".into()) }
+    g.ps_cas = p as usize;
     let create_sb: unsafe extern "system" fn(P, u32, *mut P) -> HRESULT = method(dev, CREATE_STATE_BLOCK);
     const SBT_ALL: u32 = 1;
     if create_sb(dev, SBT_ALL, &mut p) < 0 { return Err("CreateStateBlock failed".into()) }
@@ -434,20 +466,62 @@ unsafe fn setup(dev: P) -> Result<Gpu, String> {
     Ok(g)
 }
 
+/// A render-target texture of ours: (texture, surface, width, height, format).
+type Target = (usize, usize, u32, u32, u32);
+
+#[derive(Clone, Copy)]
+enum Slot {
+    /// Half-size AO term.
+    Ao = 0,
+    /// Copy of the 3D image, for sharpening.
+    Color = 1,
+}
+
 impl Gpu {
-    /// Release everything (before Reset, or when the device goes away).
-    unsafe fn free(&mut self) {
-        for p in [self.vs, self.ps_ao, self.ps_blur, self.ps_light, self.state] {
-            release(p as P);
-        }
-        if let Some((t, s, _, _)) = self.target.take() {
+    /// The render-target texture in `slot` at this size and format, (re)created as needed:
+    /// (texture, surface). Keeps `refs` (our references on the device) up to date.
+    unsafe fn target(&mut self, dev: P, slot: Slot, w: u32, h: u32, fmt: u32) -> Option<(usize, usize)> {
+        if let Some((t, s, tw, th, tf)) = self.targets[slot as usize] {
+            if (tw, th, tf) == (w, h, fmt) {
+                return Some((t, s));
+            }
+            let before = d3d9::refcount(dev);
             release(s as P);
             release(t as P);
+            self.refs = self.refs.saturating_sub(before - d3d9::refcount(dev));
+            self.targets[slot as usize] = None;
+        }
+        let create: unsafe extern "system" fn(P, u32, u32, u32, u32, u32, u32, *mut P, P) -> HRESULT = method(dev, CREATE_TEXTURE);
+        let before = d3d9::refcount(dev);
+        let mut tex = std::ptr::null_mut();
+        if create(dev, w, h, 1, USAGE_RENDERTARGET, fmt, POOL_DEFAULT, &mut tex, std::ptr::null_mut()) < 0 || tex.is_null() {
+            fail(format!("render target {w}x{h} format {fmt} create failed"));
+            return None;
+        }
+        let get_level: unsafe extern "system" fn(P, u32, *mut P) -> HRESULT = method(tex, GET_SURFACE_LEVEL);
+        let mut surf = std::ptr::null_mut();
+        get_level(tex, 0, &mut surf);
+        self.refs += d3d9::refcount(dev).saturating_sub(before);
+        self.targets[slot as usize] = Some((tex as usize, surf as usize, w, h, fmt));
+        Some((tex as usize, surf as usize))
+    }
+
+    /// Release everything (before Reset, or when the device goes away).
+    unsafe fn free(&mut self) {
+        for p in [self.vs, self.ps_ao, self.ps_blur, self.ps_light, self.ps_cas, self.state] {
+            release(p as P);
+        }
+        for t in self.targets.iter_mut() {
+            if let Some((t, s, ..)) = t.take() {
+                release(s as P);
+                release(t as P);
+            }
         }
         self.vs = 0;
         self.ps_ao = 0;
         self.ps_blur = 0;
         self.ps_light = 0;
+        self.ps_cas = 0;
         self.state = 0;
     }
 }
@@ -471,18 +545,34 @@ unsafe fn apply() {
     if dev.is_null() {
         return;
     }
-    let Some((depth_surf, depth_tex, w, h)) = DEPTH.lock().ok().and_then(|d| *d) else { return };
-    // Only while our INTZ surface is the bound depth buffer.
-    let get_ds: unsafe extern "system" fn(P, *mut P) -> HRESULT = method(dev, GET_DEPTH_STENCIL);
-    let mut ds = std::ptr::null_mut();
-    if get_ds(dev, &mut ds) < 0 || ds.is_null() {
+    let c = gfx::config();
+    let get_rt: unsafe extern "system" fn(P, u32, *mut P) -> HRESULT = method(dev, GET_RENDER_TARGET);
+    let mut back = std::ptr::null_mut();
+    if get_rt(dev, 0, &mut back) < 0 || back.is_null() {
         return;
     }
-    release(ds);
-    if ds as usize != depth_surf {
+    // IDirect3DSurface9::GetDesc (12): D3DSURFACE_DESC { format, type, usage, pool, msaa,
+    // quality, width, height }
+    let mut bd = [0u32; 8];
+    method::<unsafe extern "system" fn(P, *mut u32) -> HRESULT>(back, 12)(back, bd.as_mut_ptr());
+    let (back_fmt, w, h) = (bd[0], bd[6], bd[7]);
+    // Depth (AO, lights): only while our INTZ surface is the bound depth buffer.
+    let depth = DEPTH.lock().ok().and_then(|d| *d).filter(|&(surf, _, dw, dh)| {
+        let get_ds: unsafe extern "system" fn(P, *mut P) -> HRESULT = method(dev, GET_DEPTH_STENCIL);
+        let mut ds = std::ptr::null_mut();
+        let ok = get_ds(dev, &mut ds) >= 0 && !ds.is_null();
+        release(ds);
+        ok && ds as usize == surf && (dw, dh) == (w, h)
+    });
+    let do_ao = c.ao > 0 && depth.is_some();
+    let lights = if c.lights > 0 && depth.is_some() { crate::lights::for_shader(16) } else { Vec::new() };
+    let do_sharpen = c.sharpen > 0.0;
+    if !do_ao && lights.is_empty() && !do_sharpen {
+        release(back);
         return;
     }
-    let Ok(mut guard) = GPU.lock() else { return };
+
+    let Ok(mut guard) = GPU.lock() else { release(back); return };
     if guard.as_ref().is_some_and(|g| g.dev != dev as usize) {
         if let Some(mut old) = guard.take() {
             old.free();
@@ -493,38 +583,18 @@ unsafe fn apply() {
             Ok(g) => *guard = Some(g),
             Err(e) => {
                 fail(e);
+                release(back);
                 return;
             }
         }
     }
     let g = guard.as_mut().unwrap();
     let (aw, ah) = (w.div_ceil(2), h.div_ceil(2));
-    if !g.target.is_some_and(|t| t.2 == aw && t.3 == ah) {
-        if let Some((t, s, _, _)) = g.target.take() {
-            let before = d3d9::refcount(dev);
-            release(s as P);
-            release(t as P);
-            g.refs = g.refs.saturating_sub(before - d3d9::refcount(dev));
-        }
-        let create: unsafe extern "system" fn(P, u32, u32, u32, u32, u32, u32, *mut P, P) -> HRESULT = method(dev, CREATE_TEXTURE);
-        let before = d3d9::refcount(dev);
-        let old_refs = g.refs;
-        let mut tex = std::ptr::null_mut();
-        if create(dev, aw, ah, 1, USAGE_RENDERTARGET, FMT_A8R8G8B8, POOL_DEFAULT, &mut tex, std::ptr::null_mut()) < 0 {
-            fail("AO render target create failed".into());
-            return;
-        }
-        let get_level: unsafe extern "system" fn(P, u32, *mut P) -> HRESULT = method(tex, GET_SURFACE_LEVEL);
-        let mut surf = std::ptr::null_mut();
-        get_level(tex, 0, &mut surf);
-        g.target = Some((tex as usize, surf as usize, aw, ah));
-        g.refs = old_refs + d3d9::refcount(dev).saturating_sub(before);
-    }
-    let (ao_tex, ao_surf, _, _) = g.target.unwrap();
+    let ao_target = if do_ao { g.target(dev, Slot::Ao, aw, ah, FMT_A8R8G8B8) } else { None };
+    let color_target = if do_sharpen { g.target(dev, Slot::Color, w, h, back_fmt) } else { None };
 
     let capture: unsafe extern "system" fn(P) -> HRESULT = method(g.state as P, SB_CAPTURE);
     let restore: unsafe extern "system" fn(P) -> HRESULT = method(g.state as P, SB_APPLY);
-    let get_rt: unsafe extern "system" fn(P, u32, *mut P) -> HRESULT = method(dev, GET_RENDER_TARGET);
     let set_rt: unsafe extern "system" fn(P, u32, P) -> HRESULT = method(dev, SET_RENDER_TARGET);
     let set_ds: unsafe extern "system" fn(P, P) -> HRESULT = method(dev, SET_DEPTH_STENCIL);
     let set_vp: unsafe extern "system" fn(P, *const u32) -> HRESULT = method(dev, SET_VIEWPORT);
@@ -536,12 +606,10 @@ unsafe fn apply() {
     let set_ps: unsafe extern "system" fn(P, P) -> HRESULT = method(dev, SET_PIXEL_SHADER);
     let set_psc: unsafe extern "system" fn(P, u32, *const f32, u32) -> HRESULT = method(dev, SET_PS_CONST_F);
     let draw_up: unsafe extern "system" fn(P, u32, u32, *const c_void, u32) -> HRESULT = method(dev, DRAW_PRIMITIVE_UP);
+    let stretch: unsafe extern "system" fn(P, P, *const c_void, P, *const c_void, u32) -> HRESULT = method(dev, STRETCH_RECT);
 
     capture(g.state as P);
-    let mut back = std::ptr::null_mut();
-    get_rt(dev, 0, &mut back);
 
-    let c = gfx::config();
     let f = |a: &AtomicU32| f32::from_bits(a.load(Relaxed));
     let wvp: Vec<f32> = WORLD_VP.iter().map(|a| a.load(Relaxed) as f32).collect();
     let consts: [f32; 28] = [
@@ -553,8 +621,10 @@ unsafe fn apply() {
         f(&WORLD_PROJ[4]), f(&WORLD_PROJ[5]), 0.0, 0.0,
         1.0 / aw as f32, 1.0 / ah as f32, aw as f32, ah as f32,
     ];
-    // Unbind depth (it's sampled), no z, no blending (pass 1), no fog/stencil/alpha test.
-    set_ds(dev, std::ptr::null_mut());
+    // Unbind depth (it's sampled), no z, no blending, no fog/stencil/alpha test.
+    if depth.is_some() {
+        set_ds(dev, std::ptr::null_mut());
+    }
     for (k, v) in [(7, 0), (14, 0), (27, 0), (15, 0), (22, 1), (28, 0), (52, 0), (168, 0xF), (174, 0), (194, 0)] {
         set_rs(dev, k, v);
     }
@@ -579,38 +649,36 @@ unsafe fn apply() {
     let full = [0u32, 0, w, h, 0f32.to_bits(), 1f32.to_bits()];
     let half = [0u32, 0, aw, ah, 0f32.to_bits(), 1f32.to_bits()];
     const TRIANGLESTRIP: u32 = 5;
+    const BLEND_ZERO: u32 = 1; const BLEND_ONE: u32 = 2; const BLEND_SRCCOLOR: u32 = 3; const BLEND_DESTCOLOR: u32 = 9;
 
-    if c.ao > 0 {
-    // Pass 1: AO into our half-size texture.
-    set_rt(dev, 0, ao_surf as P);
-    set_vp(dev, half.as_ptr());
-    set_tex(dev, 0, depth_tex as P);
-    set_tex(dev, 1, std::ptr::null_mut());
-    set_ps(dev, g.ps_ao as P);
-    draw_up(dev, TRIANGLESTRIP, 2, quad(aw, ah).as_ptr().cast(), 20);
+    if let (Some((_, depth_tex, _, _)), Some((ao_tex, ao_surf))) = (depth, ao_target) {
+        // Pass 1: AO into our half-size texture.
+        set_rt(dev, 0, ao_surf as P);
+        set_vp(dev, half.as_ptr());
+        set_tex(dev, 0, depth_tex as P);
+        set_tex(dev, 1, std::ptr::null_mut());
+        set_ps(dev, g.ps_ao as P);
+        draw_up(dev, TRIANGLESTRIP, 2, quad(aw, ah).as_ptr().cast(), 20);
 
-    // Pass 2: blur and multiply onto the back buffer (or show it, for tuning).
-    set_rt(dev, 0, back);
-    set_vp(dev, full.as_ptr());
-    set_tex(dev, 1, ao_tex as P);
-    if !c.ao_debug {
-        const BLEND_ZERO: u32 = 1; const BLEND_SRCCOLOR: u32 = 3;
-        set_rs(dev, 27, 1);
-        set_rs(dev, 19, BLEND_ZERO);
-        set_rs(dev, 20, BLEND_SRCCOLOR);
-    }
-    set_ps(dev, g.ps_blur as P);
-    draw_up(dev, TRIANGLESTRIP, 2, quad(w, h).as_ptr().cast(), 20);
+        // Pass 2: blur and multiply onto the back buffer (or show it, for tuning).
+        set_rt(dev, 0, back);
+        set_vp(dev, full.as_ptr());
+        set_tex(dev, 1, ao_tex as P);
+        if !c.ao_debug {
+            set_rs(dev, 27, 1);
+            set_rs(dev, 19, BLEND_ZERO);
+            set_rs(dev, 20, BLEND_SRCCOLOR);
+        }
+        set_ps(dev, g.ps_blur as P);
+        draw_up(dev, TRIANGLESTRIP, 2, quad(w, h).as_ptr().cast(), 20);
     }
 
     // Pass 3: per-pixel lights, multiplied onto the back buffer as (1 + light).
-    let lights = if c.lights > 0 { crate::lights::for_shader(16) } else { Vec::new() };
-    if !lights.is_empty() {
+    if let (Some((_, depth_tex, _, _)), false) = (depth, lights.is_empty()) {
         set_rt(dev, 0, back);
         set_vp(dev, full.as_ptr());
-        set_tex(dev, 0, depth_tex as P); // also when AO (which binds it too) is off
+        set_tex(dev, 0, depth_tex as P);
         set_tex(dev, 1, std::ptr::null_mut());
-        const BLEND_ONE: u32 = 2; const BLEND_DESTCOLOR: u32 = 9;
         if c.lights_debug {
             set_rs(dev, 27, 0);
         } else {
@@ -626,9 +694,31 @@ unsafe fn apply() {
         draw_up(dev, TRIANGLESTRIP, 2, quad(w, h).as_ptr().cast(), 20);
     }
 
+    // Pass 4: sharpening. Copy the finished 3D image (resolving MSAA if on), then redraw it
+    // sharpened over the back buffer.
+    if let Some((color_tex, color_surf)) = color_target {
+        const FILTER_POINT: u32 = 1;
+        if stretch(dev, back, std::ptr::null(), color_surf as P, std::ptr::null(), FILTER_POINT) >= 0 {
+            set_rt(dev, 0, back);
+            set_vp(dev, full.as_ptr());
+            set_rs(dev, 27, 0);
+            set_tex(dev, 0, color_tex as P);
+            set_tex(dev, 1, std::ptr::null_mut());
+            let cas = [c.sharpen.clamp(0.0, 1.0), (h as f32 / 1080.0).max(1.0), 0.0, 0.0];
+            set_psc(dev, 40, cas.as_ptr(), 1);
+            const FILTER_LINEAR: u32 = 2;
+            set_ss(dev, 0, 5, FILTER_LINEAR); // MAGFILTER
+            set_ss(dev, 0, 6, FILTER_LINEAR); // MINFILTER
+            set_ps(dev, g.ps_cas as P);
+            draw_up(dev, TRIANGLESTRIP, 2, quad(w, h).as_ptr().cast(), 20);
+        }
+    }
+
     set_tex(dev, 0, std::ptr::null_mut());
     set_tex(dev, 1, std::ptr::null_mut());
-    set_ds(dev, depth_surf as P);
+    if let Some((depth_surf, _, _, _)) = depth {
+        set_ds(dev, depth_surf as P);
+    }
     restore(g.state as P);
     release(back);
     static LOGGED: AtomicUsize = AtomicUsize::new(0);
@@ -636,7 +726,7 @@ unsafe fn apply() {
     if n == 0 || n == 3000 {
         let (m22, m32, m23, m33) = (consts[6], consts[7], consts[20], consts[21]);
         let z = |d: f32| (m32 - d * m33) / (d * m23 - m22);
-        log!("ao: frame {n}: viewport {:?} projection m00={:.3} m11={:.3} m22={m22:.5} m32={m32:.5} m23={m23:.5} m33={m33:.5}; view z at depth 0 / 0.5 / 0.9 / 0.99: {:.2} / {:.2} / {:.2} / {:.2}",
-            &wvp, consts[4], consts[5], z(0.0), z(0.5), z(0.9), z(0.99));
+        log!("ao: frame {n}: {w}x{h} fmt {back_fmt} depth {} ao {do_ao} lights {} sharpen {do_sharpen}; viewport {:?} projection m00={:.3} m11={:.3} m22={m22:.5} m32={m32:.5} m23={m23:.5} m33={m33:.5}; view z at depth 0 / 0.5 / 0.9 / 0.99: {:.2} / {:.2} / {:.2} / {:.2}",
+            depth.is_some(), lights.len(), &wvp, consts[4], consts[5], z(0.0), z(0.5), z(0.9), z(0.99));
     }
 }

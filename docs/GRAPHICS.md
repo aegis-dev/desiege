@@ -14,6 +14,8 @@ here: render the original art better, don't replace it, and keep every effect sw
 | 32-bit textures and depth everywhere | `gfx.rs` | matters for Intel (`only_16_bit`) |
 | MSAA via dxwrapper | launcher | needs `DdrawAllowMultiSampling`; costly on iGPUs |
 | Ambient occlusion (experimental) | `d3d9.rs`, `ao.rs` | ~1.5-2 ms on a Radeon 680M; off with MSAA |
+| Per-pixel dynamic lights (experimental) | `lights.rs`, `ao.rs` | see #1 below |
+| Contrast-adaptive sharpening | `ao.rs` pass 4 | ~2 ms (mostly the copy); tap distance scales with resolution; works with MSAA |
 
 The AO work gave us the building blocks for everything below: the real Direct3D 9 device under
 dxwrapper, readable depth (INTZ), a pass inserted between the 3D world and the UI, state-block
@@ -77,10 +79,13 @@ The game's fog is per vertex and bands. Depth-based fog per pixel, with the game
 and distances (`MoodSetting::GetfogColor`, `GetfogNearDist`, `GetfogFarDist` are exported), would
 make distances smoother and allow optional ground-hugging height fog.
 
-### 5. Contrast-adaptive sharpening (CAS)
+### 5. Contrast-adaptive sharpening (CAS) - done
 
-One cheap pass that suits the game's low-resolution textures at 1440p/4K. Very low risk; good
-companion to MSAA (which softens a little).
+Launcher: Sharpening Off/Low/Medium/High. The game's textures are magnified, so their blur spans
+several pixels at high resolutions; the taps are `height / 1080` pixels apart (bilinear) rather
+than 1. Fine detail (Laplacian variance) on ground: 7.9 off, 33.7 Medium, 53.1 High.
+Screenshot: `docs/screenshots/8-sharpening.jpg`. Open: the ~2 ms is mostly the copy and the
+full-screen pass; sharing one copy with bloom (#2) would amortise it.
 
 ### Later / ideas
 
