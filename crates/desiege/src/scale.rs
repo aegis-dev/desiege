@@ -146,6 +146,7 @@ pub fn set_display_mode(w: u32, h: u32) -> (u32, u32) {
         l.clear();
     }
     shadow::reset();
+    unsafe { crate::ao::device_lost() };
     // Inactive still records V with an identity transform: the cursor overlay uses it too.
     let t = if on { fit((w, h), n) } else { Xf { s: 1.0, ox: 0.0, oy: 0.0 } };
     VW.store(w, Relaxed);

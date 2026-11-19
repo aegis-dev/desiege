@@ -191,6 +191,7 @@
           </select>
           <span class="hint">Character shadows rendered on the GPU; higher is sharper.</span>
         </label>
+        <label><input type="checkbox" id="ao"> Ambient occlusion <span class="badge">experimental</span> <span class="hint">Soft contact shadows in creases, under objects and inside foliage, computed from the depth buffer. About 2 ms per frame on integrated graphics. Needs dxwrapper; switches itself off with anti-aliasing.</span></label>
         <label><input type="checkbox" id="soft_shadows"> Soft shadow edges <span class="hint">Blurs the edges of character shadows slightly, so they no longer show stair steps.</span></label>
         <label><input type="checkbox" id="max_detail"> Full detail on every GPU <span class="hint">Ignores the game's 2002 list of "slow" graphics cards, which puts today's AMD cards on reduced detail (fewer leaves, simpler rendering).</span></label>
         <label><input type="checkbox" id="hq_formats"> 32-bit textures and depth <span class="hint">Never use 16-bit colour or depth, which the game's tables pick for some GPUs (Intel). Prevents colour banding and flickering surfaces far away.</span></label>

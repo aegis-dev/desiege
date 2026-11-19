@@ -94,6 +94,9 @@ struct Settings {
     max_detail: bool,
     #[serde(default = "yes")]
     hq_formats: bool,
+    /// Screen-space ambient occlusion (experimental; needs dxwrapper, not with MSAA).
+    #[serde(default)]
+    ao: bool,
 }
 fn default_filter() -> u32 {
     16
@@ -112,8 +115,9 @@ msaa={}
 soft_shadows={}
 max_detail={}
 hq_formats={}
+ao={}
 ",
-        s.filter, s.msaa, s.soft_shadows as u8, s.max_detail as u8, s.hq_formats as u8
+        s.filter, s.msaa, s.soft_shadows as u8, s.max_detail as u8, s.hq_formats as u8, s.ao as u8
     )
 }
 fn default_shadow_res() -> u32 {
@@ -389,6 +393,7 @@ fn load_settings(app: tauri::AppHandle) -> Settings {
             soft_shadows: true,
             max_detail: true,
             hq_formats: true,
+            ao: false,
         }
     })
 }
@@ -567,7 +572,7 @@ mod tests {
 
     #[test]
     fn builds_launch_args() {
-        let mut s = Settings { game_dir: String::new(), width: 2560, height: 1440, fullscreen: true, dxwrapper_declined: false, method: Method::Inject, borderless: false, ui_scale: 1.0, shadow_res: 128, filter: 16, msaa: 0, soft_shadows: true, max_detail: true, hq_formats: true };
+        let mut s = Settings { game_dir: String::new(), width: 2560, height: 1440, fullscreen: true, dxwrapper_declined: false, method: Method::Inject, borderless: false, ui_scale: 1.0, shadow_res: 128, filter: 16, msaa: 0, soft_shadows: true, max_detail: true, hq_formats: true, ao: false };
         assert_eq!(launch_args(&s), ["width=2560", "height=1440", "bpp=32", "fullscreen=true"]);
         s.ui_scale = 2.0;
         assert_eq!(launch_args(&s)[..2], ["width=1280", "height=720"]);
@@ -597,7 +602,7 @@ mod tests {
         assert_eq!(old.method, Method::Inject); // settings saved before the option existed
         assert_eq!(old.shadow_res, 128);
         // Settings saved before the graphics options existed get the defaults.
-        assert_eq!((old.filter, old.msaa, old.soft_shadows, old.max_detail, old.hq_formats), (16, 0, true, true, true));
+        assert_eq!((old.filter, old.msaa, old.soft_shadows, old.max_detail, old.hq_formats, old.ao), (16, 0, true, true, true, false));
         assert!(!old.borderless);
     }
 
@@ -623,6 +628,7 @@ msaa=0
 soft_shadows=0
 max_detail=1
 hq_formats=1
+ao=0
 ");
     }
 

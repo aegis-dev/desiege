@@ -6,7 +6,7 @@
 //!
 //! Texture formats and sampler states are hooked by gfx.rs.
 
-use crate::{debug::*, dynvb, method, patch, scale::*, shadow, HRESULT, P};
+use crate::{ao, debug::*, dynvb, method, patch, scale::*, shadow, HRESULT, P};
 use std::{
     ffi::c_void,
     sync::atomic::{AtomicUsize, Ordering::Relaxed},
@@ -53,6 +53,24 @@ pub unsafe fn created(dev: P, rt: P) {
     patch(dev, 31, dev_dpvb as usize, &DEV_DPVB);
     patch(dev, 32, dev_dipvb as usize, &DEV_DIPVB);
     patch(dev, 35, dev_set_texture as usize, &DEV_SET_TEX);
+}
+
+/// Before every draw: what AO needs to know (3D world drawn to the back buffer; first 2D
+/// draw after it = the UI starts, AO goes in).
+unsafe fn before_draw(fvf: u32) {
+    if RT_MAIN.load(Relaxed) {
+        if is_tl(fvf) { ao::before_2d() } else { ao::world_draw() }
+    }
+}
+
+/// Real SetViewport on the device, remembered for AO (native pixels).
+unsafe fn set_viewport(dev: P, vp: *const Viewport) -> HRESULT {
+    if let Some(v) = vp.as_ref() {
+        if RT_MAIN.load(Relaxed) {
+            ao::set_viewport(v.x, v.y, v.w, v.h);
+        }
+    }
+    call!(DEV_SET_VP as fn(P, *const Viewport) -> HRESULT; dev, vp)
 }
 
 /// DESIEGE_EXPERIMENT=vanilla: only the frame counter (for "before" benchmarks).
@@ -103,6 +121,10 @@ unsafe fn vb_scaled(vb: P, fvf: u32, start: u32, num: u32) -> Option<Vec<u8>> {
 
 unsafe extern "system" fn dev_set_transform(this: P, kind: u32, m: *const f32) -> HRESULT {
     trace(|| format!("SetTransform({kind}) m00={:.3} m11={:.3} m22={:.3} m32={:.3}", *m, *m.add(5), *m.add(10), *m.add(14)));
+    const PROJECTION: u32 = 3;
+    if kind == PROJECTION && !m.is_null() {
+        ao::set_projection(m);
+    }
     call!(DEV_SET_XFORM as fn(P, u32, *const f32) -> HRESULT; this, kind, m)
 }
 
@@ -139,13 +161,13 @@ unsafe extern "system" fn dev_set_vp(this: P, vp: *const Viewport) -> HRESULT {
         return hr;
     }
     if !scaling() || vp.is_null() {
-        return call!(DEV_SET_VP as fn(P, *const Viewport) -> HRESULT; this, vp);
+        return set_viewport(this, vp);
     }
     if let Ok(mut g) = GAME_VP.lock() {
         *g = Some(*vp);
     }
     let scaled = scale_vp(&*vp, xf());
-    call!(DEV_SET_VP as fn(P, *const Viewport) -> HRESULT; this, &scaled)
+    set_viewport(this, &scaled)
 }
 
 unsafe extern "system" fn dev_get_vp(this: P, vp: *mut Viewport) -> HRESULT {
@@ -183,6 +205,7 @@ unsafe extern "system" fn dev_clear(this: P, count: u32, rects: *const RECT, fla
 }
 
 unsafe extern "system" fn dev_dp(this: P, prim: u32, fvf: u32, verts: *const c_void, count: u32, flags: u32) -> HRESULT {
+    before_draw(fvf);
     trace(|| format!("DrawPrimitive(prim={prim} fvf=0x{fvf:X} n={count}){}", if is_tl(fvf) && !verts.is_null() { format!(" first=({:.1},{:.1})", *(verts as *const f32), *(verts as *const f32).add(1)) } else { String::new() }));
     if !active() || !is_tl(fvf) || verts.is_null() {
         stat(if is_tl(fvf) { DP_TL } else { DP_3D });
@@ -199,6 +222,7 @@ unsafe extern "system" fn dev_dp(this: P, prim: u32, fvf: u32, verts: *const c_v
 }
 
 unsafe extern "system" fn dev_dip(this: P, prim: u32, fvf: u32, verts: *const c_void, vcount: u32, idx: *const u16, icount: u32, flags: u32) -> HRESULT {
+    before_draw(fvf);
     trace(|| format!("DrawIndexedPrimitive(prim={prim} fvf=0x{fvf:X} v={vcount} i={icount})"));
     stat(if is_tl(fvf) { DIP_TL } else { DIP_3D });
     if !scaling() || !is_tl(fvf) || verts.is_null() {
@@ -220,6 +244,7 @@ unsafe extern "system" fn dev_dips(this: P, prim: u32, fvf: u32, data: *const c_
 }
 
 unsafe extern "system" fn dev_dpvb(this: P, prim: u32, vb: P, start: u32, num: u32, flags: u32) -> HRESULT {
+    before_draw(dynvb::range(vb, start, num).map_or_else(|| if vb.is_null() { 0 } else { vb_fvf(vb) }, |(_, f)| f));
     trace(|| format!("DrawPrimitiveVB(prim={prim} n={num})"));
     if let Some((ptr, fvf)) = dynvb::range(vb, start, num) {
         stat(if is_tl(fvf) { VB_TL } else { VB_3D });
@@ -240,6 +265,7 @@ unsafe extern "system" fn dev_dpvb(this: P, prim: u32, vb: P, start: u32, num: u
 }
 
 unsafe extern "system" fn dev_dipvb(this: P, prim: u32, vb: P, start: u32, num: u32, idx: *const u16, icount: u32, flags: u32) -> HRESULT {
+    before_draw(dynvb::range(vb, start, num).map_or_else(|| if vb.is_null() { 0 } else { vb_fvf(vb) }, |(_, f)| f));
     trace(|| format!("DrawIndexedPrimitiveVB(prim={prim} v={num} i={icount})"));
     if let Some((ptr, fvf)) = dynvb::range(vb, start, num) {
         // Indices are relative to `start`, which is where `ptr` points.

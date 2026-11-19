@@ -200,6 +200,7 @@ unsafe extern "system" fn sf_flip(this: P, target: P, flags: u32) -> HRESULT {
     trace(|| "Flip".into());
     trace_frame_boundary();
     stat(FLIPS);
+    crate::ao::frame_end();
     let dev = device::current();
     if !dev.is_null() {
         code_mods::run_frame();

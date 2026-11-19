@@ -136,3 +136,23 @@ absolute frame rates are pessimistic). Screenshots in `docs/screenshots`.
       render-target switch (one per character shadow). Profile shows the time in GPU waits under
       Flip. Next: count RT switches per frame and compare fps with shadows hidden; measure on NVIDIA.
 - [ ] All options on NVIDIA (RTX 3070 Ti, Steam) and Intel.
+
+## Ambient occlusion (added 2026-11-19, experimental, default off)
+
+Same laptop (Radeon 680M, 2880x1620, on battery).
+
+- [x] Pipeline: hook IDirect3D9(Ex)::CreateDevice through our own IDirect3D9 object (shared
+      vtables), depth buffer as INTZ, AO at the first 2D draw after the world, state block restore.
+- [x] Device teardown: dxwrapper releases its device to zero although our objects hold refs on it;
+      releasing ours afterwards crashed in ntdll (menu -> game). Fixed by freeing ours in a
+      device Release hook when only our references would remain.
+- [x] Cost: ~4.5 ms full resolution, ~1.5-2 ms at half resolution (112 -> ~96 fps, 120 Hz cap).
+- [x] Shader compile ~1.7-2.5 s on first use; cached on disk after that (0 ms).
+- [x] Borderless and exclusive fullscreen work; with MSAA it logs why and stays off.
+- [ ] Faint crosshatch from the 4x4 rotation pattern inside dense foliage (visible in
+      `ao_debug=1`, not really in the final image). Better noise or a wider blur would fix it.
+- [ ] Terrain triangle creases show as soft lines (real geometry, but the art never shaded them).
+      Maybe a minimum angle, or a lower strength on terrain.
+- [ ] Tune radius/strength over more areas (caves, towns, night); check NVIDIA and Intel (INTZ).
+- [ ] MSAA + AO: would need a resolve of the multisampled depth (not possible in D3D9 without
+      vendor hacks); left exclusive.

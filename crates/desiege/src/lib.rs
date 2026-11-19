@@ -114,6 +114,9 @@ unsafe fn real_proc(name: &CStr) -> usize {
             let wide: Vec<u16> = p.encode_wide().chain([0]).collect();
             let ok = !LoadLibraryW(wide.as_ptr()).is_null();
             log!("dxwrapper: {} -> {}", p.to_string_lossy(), if ok { "loaded" } else { "FAILED (native D3D7, max 2048 px wide)" });
+            if ok {
+                d3d9::install();
+            }
         }
         let lib = LoadLibraryW(system_ddraw_path().as_ptr()) as usize;
         if lib != 0 {
@@ -662,6 +665,8 @@ unsafe extern "system" fn d3d_enum_zbuf(this: P, dev: *const Guid, cb: ZCb, ctx:
 mod device;
 mod surface;
 mod system_detail;
+mod d3d9; // the real D3D9 device under dxwrapper
+mod ao; // ambient occlusion (D3D9 shaders)
 // Features:
 mod scale; // resolution decoupling (UI scale, borderless)
 mod input; // mouse and window metrics for resolution decoupling

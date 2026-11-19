@@ -36,7 +36,8 @@ runs, and turning Desiege off gives you the untouched original back.
   64 px), with optional soft edges.
 - **Graphics options that keep the original look:** anisotropic texture filtering, MSAA,
   full detail on GPUs the game's 2002 tables call "slow" (today's AMD cards among them), and
-  32-bit colour and depth everywhere. Each one can be switched off. Before/after screenshots:
+  32-bit colour and depth everywhere, and (experimental) screen-space ambient occlusion. Each
+  one can be switched off. Before/after screenshots:
   [`docs/screenshots`](docs/screenshots).
 - **Correct behaviour on modern hardware:** video memory above 2 GB is reported in a way the
   game understands, so it no longer refuses to create a 3D device.
@@ -110,6 +111,7 @@ Keep these four files together.
 | **Texture filtering** | Anisotropic 16× (default), 8×, 4×, Trilinear, Original                   | Sharper ground textures at an angle and in the distance. Practically free. |
 | **Anti-aliasing**  | Off (default), MSAA 2×, 4×, 8×                                              | Smooth edges on characters, trees and buildings. Needs dxwrapper. Expensive on integrated graphics (Radeon 680M at 2880×1620: about 115 → 55 fps). |
 | **Shadow quality** | Low (64), Normal (128), High (256), Ultra (512), Original method            | Resolution of character shadows. “Original method” turns the GPU shadow redirect off (slow; for troubleshooting). |
+| **Ambient occlusion** | off (default) / on — experimental                                     | Soft contact shadows in creases, under objects and inside foliage. About 2 ms per frame on a Radeon 680M at 2880×1620. Needs dxwrapper; off with anti-aliasing. |
 | **Soft shadow edges** | on (default) / off                                                       | Blurs the shadow edges slightly (no more stair steps, most visible at 256 px and up). |
 | **Full detail on every GPU** | on (default) / off                                                | Clears the 2002 “slow card” flags (`simple_render`, `no_complex_shadows`, `below_min_spec`) in the hardware table. Unlisted AMD GPUs fall under the old ATI defaults, which set all three. |
 | **32-bit textures and depth** | on (default) / off                                               | Hides 16-bit texture and depth formats from the game and clears `only_16_bit` (set for Intel GPUs). On NVIDIA and AMD the game already picks 32-bit, so this changes nothing there. |
@@ -167,6 +169,14 @@ and between the game and a handful of Windows APIs. The main pieces:
   (a blur radius of 0.7 % of the texture). MSAA is dxwrapper's `AntiAliasing` with
   `DdrawAllowMultiSampling`; without the latter, dxwrapper renders single-sampled and every
   texture comes out softer.
+- **Ambient occlusion** (`src/d3d9.rs`, `src/ao.rs`). The one feature that needs shaders, which
+  the game's Direct3D 7 doesn't have: Desiege hooks the real Direct3D 9 device dxwrapper creates
+  underneath, makes its depth buffer an `INTZ` texture (readable depth), and right before the game
+  draws its UI computes AO at half resolution from depth (12 samples), blurs it depth-aware at
+  full resolution and multiplies it onto the frame. All D3D9 state is saved and restored with a
+  state block. Shaders are compiled with Windows' `d3dcompiler_47.dll` and cached in
+  `%LOCALAPPDATA%\Desiege`. dxwrapper destroys its device by releasing it to zero, so Desiege
+  watches the device's `Release` and frees its own objects first.
 - **Borderless.** dxwrapper's `FullscreenWindowMode` turns exclusive fullscreen into a borderless
   window; Desiege keeps the monitor at its native mode throughout.
 
@@ -232,7 +242,7 @@ development and bug hunting; set them in the shell you start the launcher from.
 | `DESIEGE_SNAPSHOT=300,900`      | Saves the native back buffer at those frame numbers to `snap_<n>.bmp` (exclusive fullscreen can't be screen-captured). |
 | `DESIEGE_TRACE_FRAME=<n>`       | Logs every hooked graphics call of frame `<n>`. |
 | `DESIEGE_DUMP_SHADOWS=1`        | Saves the first few captured shadow textures to `shadow_<n>.bmp`. |
-| `DESIEGE_GFX=filter=0,soft_shadows=0` | Overrides graphics options from the launcher's `graphics` file (keys: `filter`, `hq_formats`, `max_detail`, `soft_shadows`, `msaa`). `filter=0,hq_formats=0,max_detail=0,soft_shadows=0` gives the game's own look. |
+| `DESIEGE_GFX=filter=0,soft_shadows=0` | Overrides graphics options from the launcher's `graphics` file (keys: `filter`, `hq_formats`, `max_detail`, `soft_shadows`, `msaa`, `ao`; AO tuning: `ao_radius`, `ao_strength`, `ao_fade_start`, `ao_fade_end`, `ao_debug=1` shows the AO term alone). `filter=0,hq_formats=0,max_detail=0,soft_shadows=0` gives the game's own look. |
 
 ## Repository layout
 
@@ -243,6 +253,8 @@ crates/desiege/      desiege.dll (all in-game fixes) and desiege-loader.exe
   src/surface.rs     IDirectDrawSurface7 hooks (Blt, Lock, Flip), dispatching to the features
   src/device.rs      IDirect3DDevice7 hooks (viewports, clears, draws, render targets)
   src/system_detail.rs  system_detail.gas redirect (resolution, vendor flags)
+  src/d3d9.rs        the real Direct3D 9 device under dxwrapper (device and depth-buffer hooks)
+  src/ao.rs          ambient occlusion (D3D9 shaders)
   src/scale.rs       resolution decoupling: virtual/native mapping, lock emulation
   src/input.rs       mouse and window metrics for resolution decoupling
   src/shadow.rs      GPU character shadows (+ soft edges)

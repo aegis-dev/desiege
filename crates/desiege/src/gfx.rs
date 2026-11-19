@@ -30,11 +30,22 @@ pub struct Config {
     pub max_detail: bool,
     pub soft_shadows: bool,
     pub msaa: u32,
+    /// Ambient occlusion (ao.rs): 0 = off, 1 = on. Tuning: radius in view units, strength,
+    /// fade-out range in view depth, debug = show the AO term alone.
+    pub ao: u32,
+    pub ao_radius: f32,
+    pub ao_strength: f32,
+    pub ao_fade_start: f32,
+    pub ao_fade_end: f32,
+    pub ao_debug: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { filter: 16, hq_formats: true, max_detail: true, soft_shadows: true, msaa: 0 }
+        Config {
+            filter: 16, hq_formats: true, max_detail: true, soft_shadows: true, msaa: 0,
+            ao: 0, ao_radius: 1.0, ao_strength: 1.6, ao_fade_start: 25.0, ao_fade_end: 40.0, ao_debug: false,
+        }
     }
 }
 
@@ -51,6 +62,12 @@ impl Config {
                 "max_detail" => self.max_detail = flag,
                 "soft_shadows" => self.soft_shadows = flag,
                 "msaa" => self.msaa = v.parse().unwrap_or(self.msaa).min(16),
+                "ao" => self.ao = v.parse().unwrap_or(self.ao).min(1),
+                "ao_radius" => self.ao_radius = v.parse().unwrap_or(self.ao_radius),
+                "ao_strength" => self.ao_strength = v.parse().unwrap_or(self.ao_strength),
+                "ao_fade_start" => self.ao_fade_start = v.parse().unwrap_or(self.ao_fade_start),
+                "ao_fade_end" => self.ao_fade_end = v.parse().unwrap_or(self.ao_fade_end),
+                "ao_debug" => self.ao_debug = flag,
                 _ => {}
             }
         }
@@ -266,6 +283,14 @@ mod tests {
         assert_eq!(c, Config { filter: 4, soft_shadows: false, msaa: 8, ..Config::default() });
         c.apply("filter=99,hq_formats=off".split(','));
         assert_eq!((c.filter, c.hq_formats), (16, false));
+    }
+
+    #[test]
+    fn parses_ao_settings() {
+        let mut c = Config::default();
+        assert_eq!(c.ao, 0); // experimental: off unless asked for
+        c.apply("ao=1,ao_radius=1.5,ao_strength=2,ao_debug=1,ao=7".split(','));
+        assert_eq!((c.ao, c.ao_radius, c.ao_strength, c.ao_debug), (1, 1.5, 2.0, true));
     }
 
     #[test]
