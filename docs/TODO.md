@@ -150,7 +150,10 @@ Same laptop (Radeon 680M, 2880x1620, on battery).
 - [x] Shader compile ~1.7-2.5 s on first use; cached on disk after that (0 ms).
 - [x] Borderless and exclusive fullscreen work; with MSAA it logs why and stays off.
 - [ ] Faint crosshatch from the 4x4 rotation pattern inside dense foliage (visible in
-      `ao_debug=1`, not really in the final image). Better noise or a wider blur would fix it.
+      `ao_debug=1`, not really in the final image). Tried interleaved gradient noise instead of
+      the 4x4 pattern (2026-11-19): worse, streaky grain everywhere, because the 4x4 blur cancels
+      a 4x4 pattern exactly but can't smooth random noise. Next idea: when the depth-aware blur
+      rejects taps at an edge, fill in with the nearest accepted rotation instead.
 - [ ] Terrain triangle creases show as soft lines (real geometry, but the art never shaded them).
       Maybe a minimum angle, or a lower strength on terrain.
 - [ ] Tune radius/strength over more areas (caves, towns, night); check NVIDIA and Intel (INTZ).
