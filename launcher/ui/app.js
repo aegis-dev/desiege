@@ -50,6 +50,7 @@ const current = () => ({
   max_detail: $('max_detail').checked,
   hq_formats: $('hq_formats').checked,
   ao: $('ao').checked,
+  lights: $('lights').checked,
 });
 
 let saveTimer;
@@ -86,6 +87,7 @@ function renderSummary() {
     ['Textures', filter],
     ['Anti-aliasing', s.msaa ? `MSAA ${s.msaa}×` : 'Off', s.msaa > 0 && !dxwInstalled],
     ['Ambient occlusion', !s.ao ? 'Off' : s.msaa ? 'Off (not with anti-aliasing)' : 'On', s.ao && !dxwInstalled],
+    ['Per-pixel lights', !s.lights ? 'Off' : s.msaa ? 'Off (not with anti-aliasing)' : 'On', s.lights && !dxwInstalled],
     ['Renderer', dxwInstalled ? 'dxwrapper (Direct3D 9)' : 'Windows Direct3D 7 (max 2048 px wide)', !dxwInstalled && s.width > 2048],
     ['Mods', enabledMods ? `${enabledMods} enabled` : 'none'],
   ];
@@ -288,6 +290,7 @@ async function init() {
   $('max_detail').checked = s.max_detail;
   $('hq_formats').checked = s.hq_formats;
   $('ao').checked = s.ao;
+  $('lights').checked = s.lights;
   document.querySelector(`input[name=method][value=${s.method}]`).checked = true;
   declined = s.dxwrapper_declined;
   dxwInstalled = await invoke('dxwrapper_installed');

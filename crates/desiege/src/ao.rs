@@ -57,13 +57,54 @@ const GET_SURFACE_LEVEL: usize = 18;
 const SB_CAPTURE: usize = 4;
 const SB_APPLY: usize = 5;
 
+/// Anything that needs the pass between world and UI (AO, per-pixel lights).
 pub fn enabled() -> bool {
-    gfx::config().ao > 0 && !FAILED.load(Relaxed)
+    let c = gfx::config();
+    (c.ao > 0 || c.lights > 0) && !FAILED.load(Relaxed)
 }
 static FAILED: AtomicBool = AtomicBool::new(false);
 fn fail(why: String) {
     if !FAILED.swap(true, Relaxed) {
         log!("ao: off ({why})");
+    }
+}
+
+// ---------------------------------------------------------------- A/B toggle (temporary)
+//
+// Insert in-game switches the experimental passes (AO, per-pixel lights) off and on, to compare
+// with the original while walking around. `toggle_key=<virtual-key code>` picks another key
+// (DESIEGE_GFX), 0 disables it. Remove once the experimental options are tuned.
+
+static SHOWN: AtomicBool = AtomicBool::new(true);
+static LABEL_UNTIL: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Once per frame (Flip): watch the key while the game window is in front, and show what's on.
+pub unsafe fn toggle_frame() {
+    use windows_sys::Win32::UI::{Input::KeyboardAndMouse::GetAsyncKeyState, WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId}};
+    let c = gfx::config();
+    if c.toggle_key == 0 || (c.ao == 0 && c.lights == 0) {
+        return;
+    }
+    static WAS_DOWN: AtomicBool = AtomicBool::new(false);
+    let mut pid = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &mut pid);
+    let down = pid == std::process::id() && GetAsyncKeyState(c.toggle_key as i32) as u16 & 0x8000 != 0;
+    if down && !WAS_DOWN.load(Relaxed) {
+        let on = !SHOWN.fetch_xor(true, Relaxed);
+        log!("ao: toggle key: experimental passes {}", if on { "on" } else { "off" });
+        if let Ok(mut l) = LABEL_UNTIL.lock() {
+            *l = Some(std::time::Instant::now() + std::time::Duration::from_millis(1500));
+        }
+    }
+    WAS_DOWN.store(down, Relaxed);
+    if LABEL_UNTIL.lock().ok().and_then(|l| *l).is_some_and(|t| std::time::Instant::now() < t) {
+        let mut parts = Vec::new();
+        if c.ao > 0 { parts.push("ambient occlusion") }
+        if c.lights > 0 { parts.push("per-pixel lights") }
+        let text = if SHOWN.load(Relaxed) { format!("NEW: {}", parts.join(" + ")) } else { "ORIGINAL".to_string() };
+        let (w, _) = crate::gpu::screen();
+        let size = (28.0 * crate::scale::ui_scale_factor()) as i32;
+        crate::overlay::queue(crate::overlay::Item { x: w as i32 / 2, y: size * 3, text: text.encode_utf16().collect(), argb: 0xFFFF_E0A0, size, align: 1 });
     }
 }
 
@@ -140,9 +181,14 @@ pub fn world_draw() {
 /// A 2D draw to the back buffer: if the world was drawn this frame, AO goes in first.
 pub unsafe fn before_2d() {
     let perspective = f32::from_bits(WORLD_PROJ[4].load(Relaxed)) != 0.0; // m23: 0 = orthographic (menus)
-    if WORLD_DRAWN.load(Relaxed) && perspective && !DONE.swap(true, Relaxed) && enabled() {
+    if WORLD_DRAWN.load(Relaxed) && perspective && !DONE.load(Relaxed) {
+        let vp: [f32; 4] = std::array::from_fn(|i| WORLD_VP[i].load(Relaxed) as f32);
+        crate::lights::debug_frame(vp);
+    }
+    if WORLD_DRAWN.load(Relaxed) && perspective && !DONE.swap(true, Relaxed) && enabled() && SHOWN.load(Relaxed) {
         apply();
     }
+    DONE.store(WORLD_DRAWN.load(Relaxed), Relaxed); // once per frame, AO or not
 }
 /// Frame boundary (Flip).
 pub fn frame_end() {
@@ -160,6 +206,8 @@ float4 rt     : register(c3); // 1/w, 1/h, w, h of the render target
 float4 fade   : register(c4); // AO fades out from view depth x to y; z = debug view
 float4 proj2  : register(c5); // m23, m33
 float4 aort   : register(c6); // 1/w, 1/h, w, h of the (half-size) AO texture
+float4 lcount : register(c7); // number of lights, strength, debug view
+float4 lights[32] : register(c8); // per light: view-space position, inner radius; rgb * intensity, outer radius
 sampler2D depthTex : register(s0);
 sampler2D aoTex    : register(s1);
 
@@ -208,9 +256,43 @@ float4 ps_ao(float2 uv0 : TEXCOORD0, float2 pix : VPOS) : COLOR {
         float falloff = saturate(1 - vv / r2);
         sum += max(0, dot(v, N) - params.z * P.z) / (vv + 0.01 * r2) * falloff;
     }
-    float ao = saturate(1 - params.y * sum * (r2 / 12));
+    // floor at 0.55: deep creases darken, nothing goes black, the overall image stays as bright
+    float ao = max(saturate(1 - params.y * sum * (r2 / 12)), 0.55);
     ao = lerp(ao, 1, saturate((P.z - fade.x) / (fade.y - fade.x)));
     return float4(ao, ao, ao, 1);
+}
+
+// Per-pixel point lights: smooth falloff from inner to outer radius, shaped by the surface
+// direction from depth. Output multiplies the frame by (1 + light), so it brightens and tints
+// what the game already drew instead of adding flat light.
+float4 ps_light(float2 uv0 : TEXCOORD0) : COLOR {
+    float2 uv = snap(uv0);
+    float d = rawDepth(uv);
+    if (d >= 0.99999) return 0;
+    float3 P = viewPos(uv);
+    float3 r = viewPos(uv + float2(rt.x, 0)) - P, l = P - viewPos(uv - float2(rt.x, 0));
+    float3 t = viewPos(uv + float2(0, rt.y)) - P, b = P - viewPos(uv - float2(0, rt.y));
+    float3 dx = abs(r.z) < abs(l.z) ? r : l;
+    float3 dy = abs(t.z) < abs(b.z) ? t : b;
+    float3 N = normalize(cross(dx, dy));
+    if (N.z > 0) N = -N;
+    float3 sum = 0;
+    for (int i = 0; i < 16; i++) {
+        if (i >= lcount.x) break;
+        float4 a = lights[2 * i], c = lights[2 * i + 1];
+        float3 L = a.xyz - P;
+        float dist = length(L);
+        // One soft curve from the centre to the outer radius (no flat plateau inside the inner
+        // radius: the game's own vertex lighting already provides that).
+        float x = saturate(dist / c.w);
+        float att = (1 - x * x) * (1 - x * x);
+        // Half-Lambert, weakened: the surface direction comes from flat-shaded triangles, and a
+        // strong facing term draws every triangle edge.
+        float facing = lerp(1, saturate(dot(N, L / max(dist, 0.001)) * 0.5 + 0.5), 0.5);
+        sum += c.rgb * att * facing;
+    }
+    float fadeOut = 1 - saturate((P.z - fade.x) / (fade.y - fade.x));
+    return float4(sum * lcount.y * fadeOut, 1);
 }
 
 // Full resolution: 4x4 AO texels (half size) around the pixel, weighted by depth similarity,
@@ -265,10 +347,10 @@ fn cache_path() -> Option<std::path::PathBuf> {
     }
     Some(std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Desiege").join(format!("ao-{h:016x}.bin")))
 }
-fn load_cache() -> Option<[Vec<u32>; 3]> {
+fn load_cache() -> Option<[Vec<u32>; 4]> {
     let bytes = std::fs::read(cache_path()?).ok()?;
     let words: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
-    let mut out: [Vec<u32>; 3] = Default::default();
+    let mut out: [Vec<u32>; 4] = Default::default();
     let mut i = 0;
     for o in &mut out {
         let n = *words.get(i)? as usize;
@@ -277,7 +359,7 @@ fn load_cache() -> Option<[Vec<u32>; 3]> {
     }
     Some(out)
 }
-fn save_cache(c: &[Vec<u32>; 3]) {
+fn save_cache(c: &[Vec<u32>; 4]) {
     let Some(path) = cache_path() else { return };
     let mut bytes = Vec::new();
     for v in c {
@@ -292,6 +374,7 @@ struct Gpu {
     vs: usize,
     ps_ao: usize,
     ps_blur: usize,
+    ps_light: usize,
     state: usize,
     /// AO render target texture + its surface, and their size.
     target: Option<(usize, usize, u32, u32)>,
@@ -320,11 +403,11 @@ unsafe fn setup(dev: P) -> Result<Gpu, String> {
         return Err("d3dcompiler_47.dll not found".into());
     }
     let t0 = std::time::Instant::now();
-    let [vs, ps_ao, ps_blur] = match load_cache() {
+    let [vs, ps_ao, ps_blur, ps_light] = match load_cache() {
         Some(c) => c,
         None => {
             let f: Compile = std::mem::transmute(GetProcAddress(lib, c"D3DCompile".as_ptr().cast()).ok_or("D3DCompile missing")?);
-            let c = [compile(f, "vs_main", "vs_3_0")?, compile(f, "ps_ao", "ps_3_0")?, compile(f, "ps_blur", "ps_3_0")?];
+            let c = [compile(f, "vs_main", "vs_3_0")?, compile(f, "ps_ao", "ps_3_0")?, compile(f, "ps_blur", "ps_3_0")?, compile(f, "ps_light", "ps_3_0")?];
             save_cache(&c);
             c
         }
@@ -332,7 +415,7 @@ unsafe fn setup(dev: P) -> Result<Gpu, String> {
     let before = d3d9::refcount(dev);
     let create_vs: unsafe extern "system" fn(P, *const u32, *mut P) -> HRESULT = method(dev, CREATE_VERTEX_SHADER);
     let create_ps: unsafe extern "system" fn(P, *const u32, *mut P) -> HRESULT = method(dev, CREATE_PIXEL_SHADER);
-    let mut g = Gpu { dev: dev as usize, vs: 0, ps_ao: 0, ps_blur: 0, state: 0, target: None, refs: 0 };
+    let mut g = Gpu { dev: dev as usize, vs: 0, ps_ao: 0, ps_blur: 0, ps_light: 0, state: 0, target: None, refs: 0 };
     let mut p = std::ptr::null_mut();
     if create_vs(dev, vs.as_ptr(), &mut p) < 0 { return Err("CreateVertexShader failed".into()) }
     g.vs = p as usize;
@@ -340,6 +423,8 @@ unsafe fn setup(dev: P) -> Result<Gpu, String> {
     g.ps_ao = p as usize;
     if create_ps(dev, ps_blur.as_ptr(), &mut p) < 0 { return Err("CreatePixelShader (blur) failed".into()) }
     g.ps_blur = p as usize;
+    if create_ps(dev, ps_light.as_ptr(), &mut p) < 0 { return Err("CreatePixelShader (lights) failed".into()) }
+    g.ps_light = p as usize;
     let create_sb: unsafe extern "system" fn(P, u32, *mut P) -> HRESULT = method(dev, CREATE_STATE_BLOCK);
     const SBT_ALL: u32 = 1;
     if create_sb(dev, SBT_ALL, &mut p) < 0 { return Err("CreateStateBlock failed".into()) }
@@ -352,7 +437,7 @@ unsafe fn setup(dev: P) -> Result<Gpu, String> {
 impl Gpu {
     /// Release everything (before Reset, or when the device goes away).
     unsafe fn free(&mut self) {
-        for p in [self.vs, self.ps_ao, self.ps_blur, self.state] {
+        for p in [self.vs, self.ps_ao, self.ps_blur, self.ps_light, self.state] {
             release(p as P);
         }
         if let Some((t, s, _, _)) = self.target.take() {
@@ -362,6 +447,7 @@ impl Gpu {
         self.vs = 0;
         self.ps_ao = 0;
         self.ps_blur = 0;
+        self.ps_light = 0;
         self.state = 0;
     }
 }
@@ -494,6 +580,7 @@ unsafe fn apply() {
     let half = [0u32, 0, aw, ah, 0f32.to_bits(), 1f32.to_bits()];
     const TRIANGLESTRIP: u32 = 5;
 
+    if c.ao > 0 {
     // Pass 1: AO into our half-size texture.
     set_rt(dev, 0, ao_surf as P);
     set_vp(dev, half.as_ptr());
@@ -514,6 +601,30 @@ unsafe fn apply() {
     }
     set_ps(dev, g.ps_blur as P);
     draw_up(dev, TRIANGLESTRIP, 2, quad(w, h).as_ptr().cast(), 20);
+    }
+
+    // Pass 3: per-pixel lights, multiplied onto the back buffer as (1 + light).
+    let lights = if c.lights > 0 { crate::lights::for_shader(16) } else { Vec::new() };
+    if !lights.is_empty() {
+        set_rt(dev, 0, back);
+        set_vp(dev, full.as_ptr());
+        set_tex(dev, 0, depth_tex as P); // also when AO (which binds it too) is off
+        set_tex(dev, 1, std::ptr::null_mut());
+        const BLEND_ONE: u32 = 2; const BLEND_DESTCOLOR: u32 = 9;
+        if c.lights_debug {
+            set_rs(dev, 27, 0);
+        } else {
+            set_rs(dev, 27, 1);
+            set_rs(dev, 19, BLEND_DESTCOLOR);
+            set_rs(dev, 20, BLEND_ONE);
+        }
+        let head = [lights.len() as f32, c.lights_strength, c.lights_debug as u32 as f32, 0.0];
+        set_psc(dev, 7, head.as_ptr(), 1);
+        let flat: Vec<f32> = lights.iter().flatten().copied().collect();
+        set_psc(dev, 8, flat.as_ptr(), 2 * lights.len() as u32);
+        set_ps(dev, g.ps_light as P);
+        draw_up(dev, TRIANGLESTRIP, 2, quad(w, h).as_ptr().cast(), 20);
+    }
 
     set_tex(dev, 0, std::ptr::null_mut());
     set_tex(dev, 1, std::ptr::null_mut());

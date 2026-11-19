@@ -667,6 +667,7 @@ mod surface;
 mod system_detail;
 mod d3d9; // the real D3D9 device under dxwrapper
 mod ao; // ambient occlusion (D3D9 shaders)
+mod lights; // the engine's dynamic lights (for per-pixel lighting)
 // Features:
 mod scale; // resolution decoupling (UI scale, borderless)
 mod input; // mouse and window metrics for resolution decoupling

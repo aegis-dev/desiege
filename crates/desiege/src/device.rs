@@ -59,7 +59,12 @@ pub unsafe fn created(dev: P, rt: P) {
 /// draw after it = the UI starts, AO goes in).
 unsafe fn before_draw(fvf: u32) {
     if RT_MAIN.load(Relaxed) {
-        if is_tl(fvf) { ao::before_2d() } else { ao::world_draw() }
+        if is_tl(fvf) {
+            ao::before_2d()
+        } else {
+            ao::world_draw();
+            crate::lights::world_draw();
+        }
     }
 }
 
@@ -124,6 +129,9 @@ unsafe extern "system" fn dev_set_transform(this: P, kind: u32, m: *const f32) -
     const PROJECTION: u32 = 3;
     if kind == PROJECTION && !m.is_null() {
         ao::set_projection(m);
+    }
+    if !m.is_null() {
+        crate::lights::set_transform(kind, m);
     }
     call!(DEV_SET_XFORM as fn(P, u32, *const f32) -> HRESULT; this, kind, m)
 }

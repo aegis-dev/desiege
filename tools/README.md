@@ -13,6 +13,7 @@ Copy a fresh build there first (`build.ps1`, then copy `target\release\desiege.d
 | `click.ps1`    | `click.ps1 <x> <y>`: moves the mouse to native screen coordinates and clicks. |
 | `capture.ps1`  | `capture.ps1 <out.png>`: screen capture (works in borderless/windowed; black in exclusive fullscreen; use `DESIEGE_SNAPSHOT` there). |
 | `perf.sh`      | `perf.sh <label> <scale> <w> <h> <continue x> <continue y>`: start, click *Continue* in the main menu, play ~70 s, print the `fps:` lines from the log. At 200 % on 2560x1440 the button is at (1280, 904). |
+| `disasm.py`    | `disasm.py <exe> <export-name-substring \| 0xADDRESS> [n]`: disassembles a function (needs `pip install capstone pefile`; run with `python -I`). Used to map the engine's light database. |
 | `pe.py`        | `pe.py exports <dll>` / `pe.py imports <exe> <dll name>`: list a PE file's exports or the functions it imports from one DLL. |
 
 Example: in-game frame rate with UI scale 2 and the profiler on (Git Bash):

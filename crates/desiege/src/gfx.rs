@@ -38,13 +38,26 @@ pub struct Config {
     pub ao_fade_start: f32,
     pub ao_fade_end: f32,
     pub ao_debug: bool,
+    /// Spike: log the engine's lights once in-game (lights.rs).
+    pub lights_probe: u32,
+    /// Per-pixel dynamic lights (lights.rs + ao.rs): 0 = off, 1 = on; strength of the added
+    /// light; debug = show the light term alone.
+    pub lights: u32,
+    pub lights_strength: f32,
+    pub lights_debug: bool,
+    /// Extra factor for the light that follows the party (it's white and strong).
+    pub lights_party: f32,
+    /// Temporary: virtual-key code that toggles AO + per-pixel lights in-game (0 = none; Insert,
+    /// which the game leaves unbound; F9 is its quick save).
+    pub toggle_key: u32,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             filter: 16, hq_formats: true, max_detail: true, soft_shadows: true, msaa: 0,
-            ao: 0, ao_radius: 1.0, ao_strength: 1.6, ao_fade_start: 25.0, ao_fade_end: 40.0, ao_debug: false,
+            ao: 0, ao_radius: 1.0, ao_strength: 1.3, ao_fade_start: 25.0, ao_fade_end: 40.0, ao_debug: false, lights_probe: 0,
+            lights: 0, lights_strength: 0.3, lights_debug: false, lights_party: 0.4, toggle_key: 0x2D,
         }
     }
 }
@@ -68,6 +81,12 @@ impl Config {
                 "ao_fade_start" => self.ao_fade_start = v.parse().unwrap_or(self.ao_fade_start),
                 "ao_fade_end" => self.ao_fade_end = v.parse().unwrap_or(self.ao_fade_end),
                 "ao_debug" => self.ao_debug = flag,
+                "lights_probe" => self.lights_probe = v.parse().unwrap_or(0),
+                "lights" => self.lights = v.parse().unwrap_or(self.lights).min(1),
+                "lights_strength" => self.lights_strength = v.parse().unwrap_or(self.lights_strength),
+                "lights_debug" => self.lights_debug = flag,
+                "lights_party" => self.lights_party = v.parse().unwrap_or(self.lights_party),
+                "toggle_key" => self.toggle_key = v.strip_prefix("0x").map_or_else(|| v.parse().ok(), |h| u32::from_str_radix(h, 16).ok()).unwrap_or(self.toggle_key),
                 _ => {}
             }
         }

@@ -51,12 +51,7 @@ FullscreenWindowMode = {}
     if msaa > 0 {
         // Without DdrawAllowMultiSampling dxwrapper renders single-sampled and copies through a
         // multisampled surface, which softens every texture (measured: -15% texture detail).
-        ini.push_str(&format!("; Multisample anti-aliasing (launcher setting)
-AntiAliasing = {msaa}
-
-[Dd7to9]
-DdrawAllowMultiSampling = 1
-"));
+        ini.push_str(&format!("; Multisample anti-aliasing (launcher setting)\nAntiAliasing = {msaa}\n\n[Dd7to9]\nDdrawAllowMultiSampling = 1\n"));
     }
     ini
 }
@@ -97,6 +92,9 @@ struct Settings {
     /// Screen-space ambient occlusion (experimental; needs dxwrapper, not with MSAA).
     #[serde(default)]
     ao: bool,
+    /// Per-pixel dynamic lights (experimental; needs dxwrapper, not with MSAA).
+    #[serde(default)]
+    lights: bool,
 }
 fn default_filter() -> u32 {
     16
@@ -110,14 +108,8 @@ fn yes() -> bool {
 /// The `graphics` file desiege.dll reads at startup (`key=value` lines).
 fn graphics_file(s: &Settings) -> String {
     format!(
-        "filter={}
-msaa={}
-soft_shadows={}
-max_detail={}
-hq_formats={}
-ao={}
-",
-        s.filter, s.msaa, s.soft_shadows as u8, s.max_detail as u8, s.hq_formats as u8, s.ao as u8
+        "filter={}\nmsaa={}\nsoft_shadows={}\nmax_detail={}\nhq_formats={}\nao={}\nlights={}\n",
+        s.filter, s.msaa, s.soft_shadows as u8, s.max_detail as u8, s.hq_formats as u8, s.ao as u8, s.lights as u8
     )
 }
 fn default_shadow_res() -> u32 {
@@ -394,6 +386,7 @@ fn load_settings(app: tauri::AppHandle) -> Settings {
             max_detail: true,
             hq_formats: true,
             ao: false,
+            lights: false,
         }
     })
 }
@@ -572,7 +565,7 @@ mod tests {
 
     #[test]
     fn builds_launch_args() {
-        let mut s = Settings { game_dir: String::new(), width: 2560, height: 1440, fullscreen: true, dxwrapper_declined: false, method: Method::Inject, borderless: false, ui_scale: 1.0, shadow_res: 128, filter: 16, msaa: 0, soft_shadows: true, max_detail: true, hq_formats: true, ao: false };
+        let mut s = Settings { game_dir: String::new(), width: 2560, height: 1440, fullscreen: true, dxwrapper_declined: false, method: Method::Inject, borderless: false, ui_scale: 1.0, shadow_res: 128, filter: 16, msaa: 0, soft_shadows: true, max_detail: true, hq_formats: true, ao: false, lights: false };
         assert_eq!(launch_args(&s), ["width=2560", "height=1440", "bpp=32", "fullscreen=true"]);
         s.ui_scale = 2.0;
         assert_eq!(launch_args(&s)[..2], ["width=1280", "height=720"]);
@@ -602,7 +595,7 @@ mod tests {
         assert_eq!(old.method, Method::Inject); // settings saved before the option existed
         assert_eq!(old.shadow_res, 128);
         // Settings saved before the graphics options existed get the defaults.
-        assert_eq!((old.filter, old.msaa, old.soft_shadows, old.max_detail, old.hq_formats, old.ao), (16, 0, true, true, true, false));
+        assert_eq!((old.filter, old.msaa, old.soft_shadows, old.max_detail, old.hq_formats, old.ao, old.lights), (16, 0, true, true, true, false, false));
         assert!(!old.borderless);
     }
 
@@ -614,8 +607,7 @@ mod tests {
         assert!(dxwrapper_ini(false, 0).contains("DisableLogging = 1"));
         assert!(!dxwrapper_ini(false, 0).contains("AntiAliasing"));
         let aa = dxwrapper_ini(false, 4);
-        assert!(aa.contains("AntiAliasing = 4") && aa.contains("[Dd7to9]
-DdrawAllowMultiSampling = 1"));
+        assert!(aa.contains("AntiAliasing = 4") && aa.contains("[Dd7to9]\nDdrawAllowMultiSampling = 1"));
     }
 
     #[test]
@@ -623,13 +615,7 @@ DdrawAllowMultiSampling = 1"));
         let mut s = load_defaults_for_test();
         s.filter = 4;
         s.soft_shadows = false;
-        assert_eq!(graphics_file(&s), "filter=4
-msaa=0
-soft_shadows=0
-max_detail=1
-hq_formats=1
-ao=0
-");
+        assert_eq!(graphics_file(&s), "filter=4\nmsaa=0\nsoft_shadows=0\nmax_detail=1\nhq_formats=1\nao=0\nlights=0\n");
     }
 
     fn load_defaults_for_test() -> Settings {
