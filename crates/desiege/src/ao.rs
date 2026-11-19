@@ -61,7 +61,7 @@ const SB_APPLY: usize = 5;
 /// Anything that needs the pass between world and UI (AO, per-pixel lights, sharpening).
 pub fn enabled() -> bool {
     let c = gfx::config();
-    (c.ao > 0 || c.lights > 0 || c.sharpen > 0.0) && !FAILED.load(Relaxed)
+    (c.ao > 0 || c.lights > 0 || c.sharpen > 0.0 || c.bloom > 0.0) && !FAILED.load(Relaxed)
 }
 /// Effects that need the depth buffer as a texture (sharpening doesn't).
 fn depth_wanted() -> bool {
@@ -108,6 +108,7 @@ pub unsafe fn toggle_frame() {
         if c.ao > 0 { parts.push("ambient occlusion") }
         if c.lights > 0 { parts.push("per-pixel lights") }
         if c.sharpen > 0.0 { parts.push("sharpening") }
+        if c.bloom > 0.0 { parts.push("bloom") }
         let text = if SHOWN.load(Relaxed) { format!("NEW: {}", parts.join(" + ")) } else { "ORIGINAL".to_string() };
         let (w, _) = crate::gpu::screen();
         let size = (28.0 * crate::scale::ui_scale_factor()) as i32;
@@ -235,6 +236,12 @@ float3 viewPos(float2 uv) {
 // full-size texels, and point sampling there rounds inconsistently (grid lines).
 float2 snap(float2 uv) { return (floor(uv * rt.zw) + 0.5) * rt.xy; }
 
+// Colour bleeding: the AO pass also averages the colour of what occludes each pixel (from a copy
+// of the image before AO, s1), weighted like the occlusion; the composite tints the shadow
+// towards that hue. Output: rgb = occluder colour (white = none), a = AO.
+float4 aobleed : register(c43); // x = bleed strength (0 = off)
+sampler2D bleedTex : register(s1);
+
 float4 ps_ao(float2 uv0 : TEXCOORD0, float2 pix : VPOS) : COLOR {
     float2 uv = snap(uv0);
     float d = rawDepth(uv);
@@ -253,20 +260,24 @@ float4 ps_ao(float2 uv0 : TEXCOORD0, float2 pix : VPOS) : COLOR {
     float2 cell = fmod(pix, 4);
     float rot = (cell.x * 4 + cell.y) * (6.2831853 / 16);
     float sum = 0;
+    float3 tint = 0;
     float r2 = params.x * params.x;
     [unroll] for (int i = 0; i < 12; i++) {
         float a = i * 2.3999632 + rot;
         float s = sqrt((i + 0.5) / 12);
-        float2 o = float2(cos(a), sin(a)) * s * rpx * rt.xy;
-        float3 v = viewPos(snap(uv + o)) - P;
+        float2 q = snap(uv + float2(cos(a), sin(a)) * s * rpx * rt.xy);
+        float3 v = viewPos(q) - P;
         float vv = dot(v, v);
         float falloff = saturate(1 - vv / r2);
-        sum += max(0, dot(v, N) - params.z * P.z) / (vv + 0.01 * r2) * falloff;
+        float occ = max(0, dot(v, N) - params.z * P.z) / (vv + 0.01 * r2) * falloff;
+        sum += occ;
+        if (aobleed.x > 0) tint += tex2Dlod(bleedTex, float4(q, 0, 0)).rgb * occ;
     }
     // floor at 0.55: deep creases darken, nothing goes black, the overall image stays as bright
     float ao = max(saturate(1 - params.y * sum * (r2 / 12)), 0.55);
     ao = lerp(ao, 1, saturate((P.z - fade.x) / (fade.y - fade.x)));
-    return float4(ao, ao, ao, 1);
+    float3 c = (aobleed.x > 0 && sum > 1e-4) ? tint / sum : 1;
+    return float4(c, ao);
 }
 
 // Per-pixel point lights: smooth falloff from inner to outer radius, shaped by the surface
@@ -324,11 +335,50 @@ float4 ps_cas(float2 uv : TEXCOORD0) : COLOR {
     return float4(saturate(o), 1);
 }
 
+// Bloom: bright parts of the 3D image (soft threshold on the brightest channel, weighted by
+// saturation), downsampled to quarter size, blurred, added back. The game image is LDR, so
+// "bright" is relative: threshold/knee in `bloom`.
+float4 blurdir : register(c41); // xy = one texel of the source, along the blur direction
+float4 bloom : register(c42);   // threshold, knee, intensity
+float4 ps_bright(float2 uv : TEXCOORD0) : COLOR {
+    // 4 bilinear taps = the 4x4 full-size texels under this quarter-size pixel
+    float3 s = 0;
+    s += tex2Dlod(colorTex, float4(uv + float2(-1, -1) * rt.xy, 0, 0)).rgb;
+    s += tex2Dlod(colorTex, float4(uv + float2(1, -1) * rt.xy, 0, 0)).rgb;
+    s += tex2Dlod(colorTex, float4(uv + float2(-1, 1) * rt.xy, 0, 0)).rgb;
+    s += tex2Dlod(colorTex, float4(uv + float2(1, 1) * rt.xy, 0, 0)).rgb;
+    s *= 0.25;
+    float m = max(s.r, max(s.g, s.b));
+    float k = saturate((m - bloom.x) / bloom.y);
+    // Saturated colours (fire, spells) glow fully; pale ones (a white shirt in the party light,
+    // sunlit stone) only partly, so bright surfaces don't look like light sources.
+    float sat = (m - min(s.r, min(s.g, s.b))) / max(m, 1e-4);
+    return float4(s * k * k * lerp(0.3, 1.0, sat), 1);
+}
+// 9-tap Gaussian in 5 bilinear reads (offsets/weights of the linear-sampling trick).
+float4 ps_blur9(float2 uv : TEXCOORD0) : COLOR {
+    float3 s = tex2Dlod(colorTex, float4(uv, 0, 0)).rgb * 0.2270270;
+    s += tex2Dlod(colorTex, float4(uv + blurdir.xy * 1.3846154, 0, 0)).rgb * 0.3162162;
+    s += tex2Dlod(colorTex, float4(uv - blurdir.xy * 1.3846154, 0, 0)).rgb * 0.3162162;
+    s += tex2Dlod(colorTex, float4(uv + blurdir.xy * 3.2307692, 0, 0)).rgb * 0.0702703;
+    s += tex2Dlod(colorTex, float4(uv - blurdir.xy * 3.2307692, 0, 0)).rgb * 0.0702703;
+    return float4(s, 1);
+}
+// Two scales: s0 = after the first blur round (a tight halo that keeps a small flame's
+// energy close), s1 = after the last (the wide soft glow).
+sampler2D wideTex : register(s1);
+float4 ps_bloom(float2 uv : TEXCOORD0) : COLOR {
+    float3 narrow = tex2Dlod(colorTex, float4(uv, 0, 0)).rgb;
+    float3 wide = tex2Dlod(wideTex, float4(uv, 0, 0)).rgb;
+    return float4((narrow + wide * 0.7) * bloom.z, 1);
+}
+
 // Full resolution: 4x4 AO texels (half size) around the pixel, weighted by depth similarity,
 // which also undoes the 4x4 rotation pattern and upsamples without halos at silhouettes.
 float4 ps_blur(float2 uv : TEXCOORD0) : COLOR {
     float zc = viewZ(rawDepth(uv));
-    float sum = 0, w = 0;
+    float4 sum = 0;
+    float w = 0;
     // The 4x4 AO texels around this pixel, addressed at exact texel centres; any 4x4 block
     // holds each rotation of the pattern once.
     float2 base = floor(uv * aort.zw - 1.5);
@@ -336,11 +386,16 @@ float4 ps_blur(float2 uv : TEXCOORD0) : COLOR {
         float2 t = (base + float2(x, y) + 0.5) * aort.xy;
         float z = viewZ(rawDepth(snap(t)));
         float k = saturate(1 - abs(z - zc) / (0.05 * zc));
-        sum += tex2Dlod(aoTex, float4(t, 0, 0)).r * k;
+        sum += tex2Dlod(aoTex, float4(t, 0, 0)) * k;
         w += k;
     }
-    float ao = w > 0 ? sum / w : 1;
-    return float4(ao, ao, ao, 1);
+    float4 r = w > 0 ? sum / w : 1;
+    // darken by AO; shift the hue towards the occluders' colour (normalised to the same
+    // brightness, so only the hue changes) by how occluded the pixel is
+    float lum = dot(r.rgb, float3(0.299, 0.587, 0.114));
+    float3 hue = clamp(r.rgb / max(lum, 0.05), 0, 2);
+    float3 m = r.a * lerp(1, hue, aobleed.x * (1 - r.a) * 2);
+    return float4(m, 1);
 }
 "#;
 
@@ -367,8 +422,8 @@ unsafe fn compile(f: Compile, entry: &str, target: &str) -> Result<Vec<u32>, Str
     Ok(bytes.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap_or([0; 4]))).collect())
 }
 
-/// Compiled shaders are cached in %LOCALAPPDATA%\Desiegeo-<hash of the source>.bin
-/// (compiling takes ~1.7 s, a visible hitch when the first world frame is drawn).
+/// Compiled shaders are cached in `%LOCALAPPDATA%\Desiege\ao-<hash of the source>.bin`
+/// (compiling takes ~2 s, a visible hitch when the first world frame is drawn).
 fn cache_path() -> Option<std::path::PathBuf> {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a
     for b in HLSL.bytes() {
@@ -376,19 +431,19 @@ fn cache_path() -> Option<std::path::PathBuf> {
     }
     Some(std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Desiege").join(format!("ao-{h:016x}.bin")))
 }
-fn load_cache() -> Option<[Vec<u32>; 5]> {
+fn load_cache(n: usize) -> Option<Vec<Vec<u32>>> {
     let bytes = std::fs::read(cache_path()?).ok()?;
     let words: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
-    let mut out: [Vec<u32>; 5] = Default::default();
+    let mut out = Vec::with_capacity(n);
     let mut i = 0;
-    for o in &mut out {
-        let n = *words.get(i)? as usize;
-        *o = words.get(i + 1..i + 1 + n)?.to_vec();
-        i += 1 + n;
+    for _ in 0..n {
+        let len = *words.get(i)? as usize;
+        out.push(words.get(i + 1..i + 1 + len)?.to_vec());
+        i += 1 + len;
     }
     Some(out)
 }
-fn save_cache(c: &[Vec<u32>; 5]) {
+fn save_cache(c: &[Vec<u32>]) {
     let Some(path) = cache_path() else { return };
     let mut bytes = Vec::new();
     for v in c {
@@ -398,16 +453,26 @@ fn save_cache(c: &[Vec<u32>; 5]) {
     let _ = std::fs::write(path, bytes);
 }
 
+/// Pixel shaders, by index into `Gpu::ps` (entry points in HLSL).
+#[derive(Clone, Copy)]
+enum Ps {
+    Ao,
+    AoBlur,
+    Light,
+    Sharpen,
+    Bright,
+    Blur9,
+    BloomAdd,
+}
+const PS_ENTRIES: [&str; 7] = ["ps_ao", "ps_blur", "ps_light", "ps_cas", "ps_bright", "ps_blur9", "ps_bloom"];
+
 struct Gpu {
     dev: usize,
     vs: usize,
-    ps_ao: usize,
-    ps_blur: usize,
-    ps_light: usize,
-    ps_cas: usize,
+    ps: [usize; PS_ENTRIES.len()],
     state: usize,
     /// Render-target textures by `Slot`.
-    targets: [Option<Target>; 2],
+    targets: [Option<Target>; 5],
     /// References our objects hold on the device (see d3d9::dev9_release).
     refs: u32,
 }
@@ -433,11 +498,15 @@ unsafe fn setup(dev: P) -> Result<Gpu, String> {
         return Err("d3dcompiler_47.dll not found".into());
     }
     let t0 = std::time::Instant::now();
-    let [vs, ps_ao, ps_blur, ps_light, ps_cas] = match load_cache() {
+    let n = 1 + PS_ENTRIES.len();
+    let code = match load_cache(n) {
         Some(c) => c,
         None => {
             let f: Compile = std::mem::transmute(GetProcAddress(lib, c"D3DCompile".as_ptr().cast()).ok_or("D3DCompile missing")?);
-            let c = [compile(f, "vs_main", "vs_3_0")?, compile(f, "ps_ao", "ps_3_0")?, compile(f, "ps_blur", "ps_3_0")?, compile(f, "ps_light", "ps_3_0")?, compile(f, "ps_cas", "ps_3_0")?];
+            let mut c = vec![compile(f, "vs_main", "vs_3_0")?];
+            for e in PS_ENTRIES {
+                c.push(compile(f, e, "ps_3_0")?);
+            }
             save_cache(&c);
             c
         }
@@ -445,21 +514,25 @@ unsafe fn setup(dev: P) -> Result<Gpu, String> {
     let before = d3d9::refcount(dev);
     let create_vs: unsafe extern "system" fn(P, *const u32, *mut P) -> HRESULT = method(dev, CREATE_VERTEX_SHADER);
     let create_ps: unsafe extern "system" fn(P, *const u32, *mut P) -> HRESULT = method(dev, CREATE_PIXEL_SHADER);
-    let mut g = Gpu { dev: dev as usize, vs: 0, ps_ao: 0, ps_blur: 0, ps_light: 0, ps_cas: 0, state: 0, targets: [None; 2], refs: 0 };
+    let mut g = Gpu { dev: dev as usize, vs: 0, ps: [0; PS_ENTRIES.len()], state: 0, targets: [None; 5], refs: 0 };
     let mut p = std::ptr::null_mut();
-    if create_vs(dev, vs.as_ptr(), &mut p) < 0 { return Err("CreateVertexShader failed".into()) }
+    if create_vs(dev, code[0].as_ptr(), &mut p) < 0 {
+        return Err("CreateVertexShader failed".into());
+    }
     g.vs = p as usize;
-    if create_ps(dev, ps_ao.as_ptr(), &mut p) < 0 { return Err("CreatePixelShader (ao) failed".into()) }
-    g.ps_ao = p as usize;
-    if create_ps(dev, ps_blur.as_ptr(), &mut p) < 0 { return Err("CreatePixelShader (blur) failed".into()) }
-    g.ps_blur = p as usize;
-    if create_ps(dev, ps_light.as_ptr(), &mut p) < 0 { return Err("CreatePixelShader (lights) failed".into()) }
-    g.ps_light = p as usize;
-    if create_ps(dev, ps_cas.as_ptr(), &mut p) < 0 { return Err("CreatePixelShader (sharpen) failed".into()) }
-    g.ps_cas = p as usize;
+    for (i, e) in PS_ENTRIES.iter().enumerate() {
+        if create_ps(dev, code[1 + i].as_ptr(), &mut p) < 0 {
+            g.free();
+            return Err(format!("CreatePixelShader ({e}) failed"));
+        }
+        g.ps[i] = p as usize;
+    }
     let create_sb: unsafe extern "system" fn(P, u32, *mut P) -> HRESULT = method(dev, CREATE_STATE_BLOCK);
     const SBT_ALL: u32 = 1;
-    if create_sb(dev, SBT_ALL, &mut p) < 0 { return Err("CreateStateBlock failed".into()) }
+    if create_sb(dev, SBT_ALL, &mut p) < 0 {
+        g.free();
+        return Err("CreateStateBlock failed".into());
+    }
     g.state = p as usize;
     g.refs = d3d9::refcount(dev).saturating_sub(before);
     log!("ao: shaders ready in {} ms", t0.elapsed().as_millis());
@@ -473,11 +546,19 @@ type Target = (usize, usize, u32, u32, u32);
 enum Slot {
     /// Half-size AO term.
     Ao = 0,
-    /// Copy of the 3D image, for sharpening.
+    /// Copy of the 3D image (sharpening, bloom source).
     Color = 1,
+    /// Quarter-size bloom ping-pong pair, and the narrow scale kept after the first round.
+    BloomA = 2,
+    BloomB = 3,
+    BloomNarrow = 4,
 }
 
 impl Gpu {
+    fn ps(&self, p: Ps) -> P {
+        self.ps[p as usize] as P
+    }
+
     /// The render-target texture in `slot` at this size and format, (re)created as needed:
     /// (texture, surface). Keeps `refs` (our references on the device) up to date.
     unsafe fn target(&mut self, dev: P, slot: Slot, w: u32, h: u32, fmt: u32) -> Option<(usize, usize)> {
@@ -508,8 +589,9 @@ impl Gpu {
 
     /// Release everything (before Reset, or when the device goes away).
     unsafe fn free(&mut self) {
-        for p in [self.vs, self.ps_ao, self.ps_blur, self.ps_light, self.ps_cas, self.state] {
-            release(p as P);
+        for p in std::iter::once(&mut self.vs).chain(self.ps.iter_mut()).chain(std::iter::once(&mut self.state)) {
+            release(*p as P);
+            *p = 0;
         }
         for t in self.targets.iter_mut() {
             if let Some((t, s, ..)) = t.take() {
@@ -517,12 +599,6 @@ impl Gpu {
                 release(t as P);
             }
         }
-        self.vs = 0;
-        self.ps_ao = 0;
-        self.ps_blur = 0;
-        self.ps_light = 0;
-        self.ps_cas = 0;
-        self.state = 0;
     }
 }
 
@@ -567,7 +643,8 @@ unsafe fn apply() {
     let do_ao = c.ao > 0 && depth.is_some();
     let lights = if c.lights > 0 && depth.is_some() { crate::lights::for_shader(16) } else { Vec::new() };
     let do_sharpen = c.sharpen > 0.0;
-    if !do_ao && lights.is_empty() && !do_sharpen {
+    let do_bloom = c.bloom > 0.0;
+    if !do_ao && lights.is_empty() && !do_sharpen && !do_bloom {
         release(back);
         return;
     }
@@ -591,7 +668,15 @@ unsafe fn apply() {
     let g = guard.as_mut().unwrap();
     let (aw, ah) = (w.div_ceil(2), h.div_ceil(2));
     let ao_target = if do_ao { g.target(dev, Slot::Ao, aw, ah, FMT_A8R8G8B8) } else { None };
-    let color_target = if do_sharpen { g.target(dev, Slot::Color, w, h, back_fmt) } else { None };
+    let do_bleed = do_ao && c.ao_bleed > 0.0;
+    let color_target = if do_sharpen || do_bloom || do_bleed { g.target(dev, Slot::Color, w, h, back_fmt) } else { None };
+    let (qw, qh) = (w.div_ceil(4), h.div_ceil(4));
+    let bloom_targets = if do_bloom {
+        let n = g.target(dev, Slot::BloomNarrow, qw, qh, FMT_A8R8G8B8);
+        g.target(dev, Slot::BloomA, qw, qh, FMT_A8R8G8B8).zip(g.target(dev, Slot::BloomB, qw, qh, FMT_A8R8G8B8)).zip(n)
+    } else {
+        None
+    };
 
     let capture: unsafe extern "system" fn(P) -> HRESULT = method(g.state as P, SB_CAPTURE);
     let restore: unsafe extern "system" fn(P) -> HRESULT = method(g.state as P, SB_APPLY);
@@ -651,14 +736,23 @@ unsafe fn apply() {
     const TRIANGLESTRIP: u32 = 5;
     const BLEND_ZERO: u32 = 1; const BLEND_ONE: u32 = 2; const BLEND_SRCCOLOR: u32 = 3; const BLEND_DESTCOLOR: u32 = 9;
 
+    let stretch_ok = |dst: usize| stretch(dev, back, std::ptr::null(), dst as P, std::ptr::null(), 1 /* POINT */) >= 0;
+    let bleed = [if do_bleed { c.ao_bleed } else { 0.0 }, 0.0, 0.0, 0.0];
+    set_psc(dev, 43, bleed.as_ptr(), 1);
     if let (Some((_, depth_tex, _, _)), Some((ao_tex, ao_surf))) = (depth, ao_target) {
-        // Pass 1: AO into our half-size texture.
+        // Pass 1: AO into our half-size texture (plus the occluders' colour, from a copy of the
+        // image as it is now, for colour bleeding).
+        let bleed_src = color_target.filter(|&(_, surf)| do_bleed && stretch_ok(surf)).map(|(tex, _)| tex);
         set_rt(dev, 0, ao_surf as P);
         set_vp(dev, half.as_ptr());
         set_tex(dev, 0, depth_tex as P);
-        set_tex(dev, 1, std::ptr::null_mut());
-        set_ps(dev, g.ps_ao as P);
+        set_tex(dev, 1, bleed_src.unwrap_or(0) as P);
+        set_ss(dev, 1, 5, 2); // bilinear colour reads
+        set_ss(dev, 1, 6, 2);
+        set_ps(dev, g.ps(Ps::Ao));
         draw_up(dev, TRIANGLESTRIP, 2, quad(aw, ah).as_ptr().cast(), 20);
+        set_ss(dev, 1, 5, 1); // the blur reads AO texels exactly
+        set_ss(dev, 1, 6, 1);
 
         // Pass 2: blur and multiply onto the back buffer (or show it, for tuning).
         set_rt(dev, 0, back);
@@ -669,7 +763,7 @@ unsafe fn apply() {
             set_rs(dev, 19, BLEND_ZERO);
             set_rs(dev, 20, BLEND_SRCCOLOR);
         }
-        set_ps(dev, g.ps_blur as P);
+        set_ps(dev, g.ps(Ps::AoBlur));
         draw_up(dev, TRIANGLESTRIP, 2, quad(w, h).as_ptr().cast(), 20);
     }
 
@@ -690,26 +784,66 @@ unsafe fn apply() {
         set_psc(dev, 7, head.as_ptr(), 1);
         let flat: Vec<f32> = lights.iter().flatten().copied().collect();
         set_psc(dev, 8, flat.as_ptr(), 2 * lights.len() as u32);
-        set_ps(dev, g.ps_light as P);
+        set_ps(dev, g.ps(Ps::Light));
         draw_up(dev, TRIANGLESTRIP, 2, quad(w, h).as_ptr().cast(), 20);
     }
 
-    // Pass 4: sharpening. Copy the finished 3D image (resolving MSAA if on), then redraw it
-    // sharpened over the back buffer.
-    if let Some((color_tex, color_surf)) = color_target {
-        const FILTER_POINT: u32 = 1;
-        if stretch(dev, back, std::ptr::null(), color_surf as P, std::ptr::null(), FILTER_POINT) >= 0 {
-            set_rt(dev, 0, back);
-            set_vp(dev, full.as_ptr());
-            set_rs(dev, 27, 0);
+    // Passes 4-6 read a copy of the finished 3D image (StretchRect also resolves MSAA).
+    const FILTER_POINT: u32 = 1; const FILTER_LINEAR: u32 = 2;
+    let copied = color_target.is_some_and(|(_, surf)| stretch(dev, back, std::ptr::null(), surf as P, std::ptr::null(), FILTER_POINT) >= 0);
+    if let (true, Some((color_tex, _))) = (copied, color_target) {
+        set_tex(dev, 1, std::ptr::null_mut());
+        set_ss(dev, 0, 5, FILTER_LINEAR); // MAGFILTER
+        set_ss(dev, 0, 6, FILTER_LINEAR); // MINFILTER
+        set_rs(dev, 27, 0);
+
+        // Pass 4: bloom source: bright parts at quarter size, blurred (H, V) three times.
+        if let Some((((a_tex, a_surf), (b_tex, b_surf)), (_, n_surf))) = bloom_targets {
+            let quarter = [0u32, 0, qw, qh, 0f32.to_bits(), 1f32.to_bits()];
+            let params = [c.bloom_threshold, 0.25, c.bloom, 0.0];
+            set_psc(dev, 42, params.as_ptr(), 1);
+            set_rt(dev, 0, a_surf as P);
+            set_vp(dev, quarter.as_ptr());
             set_tex(dev, 0, color_tex as P);
-            set_tex(dev, 1, std::ptr::null_mut());
+            set_ps(dev, g.ps(Ps::Bright));
+            draw_up(dev, TRIANGLESTRIP, 2, quad(qw, qh).as_ptr().cast(), 20);
+            set_ps(dev, g.ps(Ps::Blur9));
+            // growing tap spacing per round: a wide, soft glow (~75 px at full size) for 6 passes
+            for step in [1.0f32, 2.0, 3.0] {
+                for (src, dst, dir) in [(a_tex, b_surf, [step / qw as f32, 0.0]), (b_tex, a_surf, [0.0, step / qh as f32])] {
+                    let d = [dir[0], dir[1], 0.0, 0.0];
+                    set_psc(dev, 41, d.as_ptr(), 1);
+                    set_rt(dev, 0, dst as P);
+                    set_tex(dev, 0, src as P);
+                    draw_up(dev, TRIANGLESTRIP, 2, quad(qw, qh).as_ptr().cast(), 20);
+                }
+                if step == 1.0 {
+                    stretch(dev, a_surf as P, std::ptr::null(), n_surf as P, std::ptr::null(), FILTER_POINT);
+                }
+            }
+        }
+
+        // Pass 5: sharpening: redraw the copy sharpened over the back buffer.
+        set_rt(dev, 0, back);
+        set_vp(dev, full.as_ptr());
+        if do_sharpen {
+            set_tex(dev, 0, color_tex as P);
             let cas = [c.sharpen.clamp(0.0, 1.0), (h as f32 / 1080.0).max(1.0), 0.0, 0.0];
             set_psc(dev, 40, cas.as_ptr(), 1);
-            const FILTER_LINEAR: u32 = 2;
-            set_ss(dev, 0, 5, FILTER_LINEAR); // MAGFILTER
-            set_ss(dev, 0, 6, FILTER_LINEAR); // MINFILTER
-            set_ps(dev, g.ps_cas as P);
+            set_ps(dev, g.ps(Ps::Sharpen));
+            draw_up(dev, TRIANGLESTRIP, 2, quad(w, h).as_ptr().cast(), 20);
+        }
+
+        // Pass 6: bloom added on top (upsampled bilinearly from quarter size).
+        if let Some((((a_tex, _), _), (n_tex, _))) = bloom_targets {
+            set_tex(dev, 0, n_tex as P);
+            set_tex(dev, 1, a_tex as P);
+            set_ss(dev, 1, 5, FILTER_LINEAR);
+            set_ss(dev, 1, 6, FILTER_LINEAR);
+            set_rs(dev, 27, 1);
+            set_rs(dev, 19, BLEND_ONE);
+            set_rs(dev, 20, BLEND_ONE);
+            set_ps(dev, g.ps(Ps::BloomAdd));
             draw_up(dev, TRIANGLESTRIP, 2, quad(w, h).as_ptr().cast(), 20);
         }
     }
@@ -726,7 +860,7 @@ unsafe fn apply() {
     if n == 0 || n == 3000 {
         let (m22, m32, m23, m33) = (consts[6], consts[7], consts[20], consts[21]);
         let z = |d: f32| (m32 - d * m33) / (d * m23 - m22);
-        log!("ao: frame {n}: {w}x{h} fmt {back_fmt} depth {} ao {do_ao} lights {} sharpen {do_sharpen}; viewport {:?} projection m00={:.3} m11={:.3} m22={m22:.5} m32={m32:.5} m23={m23:.5} m33={m33:.5}; view z at depth 0 / 0.5 / 0.9 / 0.99: {:.2} / {:.2} / {:.2} / {:.2}",
+        log!("ao: frame {n}: {w}x{h} fmt {back_fmt} depth {} ao {do_ao} lights {} sharpen {do_sharpen} bloom {do_bloom}; viewport {:?} projection m00={:.3} m11={:.3} m22={m22:.5} m32={m32:.5} m23={m23:.5} m33={m33:.5}; view z at depth 0 / 0.5 / 0.9 / 0.99: {:.2} / {:.2} / {:.2} / {:.2}",
             depth.is_some(), lights.len(), &wvp, consts[4], consts[5], z(0.0), z(0.5), z(0.9), z(0.99));
     }
 }

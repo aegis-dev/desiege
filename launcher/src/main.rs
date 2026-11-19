@@ -98,6 +98,9 @@ struct Settings {
     /// Contrast-adaptive sharpening, 0 = off .. 1 (needs dxwrapper).
     #[serde(default)]
     sharpen: f32,
+    /// Bloom intensity, 0 = off (needs dxwrapper).
+    #[serde(default)]
+    bloom: f32,
 }
 fn default_filter() -> u32 {
     16
@@ -111,8 +114,8 @@ fn yes() -> bool {
 /// The `graphics` file desiege.dll reads at startup (`key=value` lines).
 fn graphics_file(s: &Settings) -> String {
     format!(
-        "filter={}\nmsaa={}\nsoft_shadows={}\nmax_detail={}\nhq_formats={}\nao={}\nlights={}\nsharpen={}\n",
-        s.filter, s.msaa, s.soft_shadows as u8, s.max_detail as u8, s.hq_formats as u8, s.ao as u8, s.lights as u8, s.sharpen
+        "filter={}\nmsaa={}\nsoft_shadows={}\nmax_detail={}\nhq_formats={}\nao={}\nlights={}\nsharpen={}\nbloom={}\n",
+        s.filter, s.msaa, s.soft_shadows as u8, s.max_detail as u8, s.hq_formats as u8, s.ao as u8, s.lights as u8, s.sharpen, s.bloom
     )
 }
 fn default_shadow_res() -> u32 {
@@ -391,6 +394,7 @@ fn load_settings(app: tauri::AppHandle) -> Settings {
             ao: false,
             lights: false,
             sharpen: 0.0,
+            bloom: 0.0,
         }
     })
 }
@@ -412,7 +416,7 @@ fn launch(app: tauri::AppHandle, settings: Settings) -> Result<(), String> {
     if !(1.0..=4.0).contains(&settings.ui_scale) {
         return Err("UI scale out of range".into());
     }
-    if !FILTER_CHOICES.contains(&settings.filter) || !MSAA_CHOICES.contains(&settings.msaa) || !(0.0..=1.0).contains(&settings.sharpen) {
+    if !FILTER_CHOICES.contains(&settings.filter) || !MSAA_CHOICES.contains(&settings.msaa) || !(0.0..=1.0).contains(&settings.sharpen) || !(0.0..=2.0).contains(&settings.bloom) {
         return Err("Graphics setting out of range".into());
     }
     let runtime = ensure_runtime(&app)?;
@@ -569,7 +573,7 @@ mod tests {
 
     #[test]
     fn builds_launch_args() {
-        let mut s = Settings { game_dir: String::new(), width: 2560, height: 1440, fullscreen: true, dxwrapper_declined: false, method: Method::Inject, borderless: false, ui_scale: 1.0, shadow_res: 128, filter: 16, msaa: 0, soft_shadows: true, max_detail: true, hq_formats: true, ao: false, lights: false, sharpen: 0.0 };
+        let mut s = Settings { game_dir: String::new(), width: 2560, height: 1440, fullscreen: true, dxwrapper_declined: false, method: Method::Inject, borderless: false, ui_scale: 1.0, shadow_res: 128, filter: 16, msaa: 0, soft_shadows: true, max_detail: true, hq_formats: true, ao: false, lights: false, sharpen: 0.0, bloom: 0.0 };
         assert_eq!(launch_args(&s), ["width=2560", "height=1440", "bpp=32", "fullscreen=true"]);
         s.ui_scale = 2.0;
         assert_eq!(launch_args(&s)[..2], ["width=1280", "height=720"]);
@@ -619,7 +623,7 @@ mod tests {
         let mut s = load_defaults_for_test();
         s.filter = 4;
         s.soft_shadows = false;
-        assert_eq!(graphics_file(&s), "filter=4\nmsaa=0\nsoft_shadows=0\nmax_detail=1\nhq_formats=1\nao=0\nlights=0\nsharpen=0\n");
+        assert_eq!(graphics_file(&s), "filter=4\nmsaa=0\nsoft_shadows=0\nmax_detail=1\nhq_formats=1\nao=0\nlights=0\nsharpen=0\nbloom=0\n");
     }
 
     fn load_defaults_for_test() -> Settings {

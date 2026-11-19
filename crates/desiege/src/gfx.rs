@@ -38,6 +38,9 @@ pub struct Config {
     pub ao_fade_start: f32,
     pub ao_fade_end: f32,
     pub ao_debug: bool,
+    /// AO colour bleeding: how much the shadow takes on the hue of what casts it (0 = off, the
+    /// default: subtle for its ~2 ms, an extra copy of the image; 0.6 is a good value to try).
+    pub ao_bleed: f32,
     /// Spike: log the engine's lights once in-game (lights.rs).
     pub lights_probe: u32,
     /// Per-pixel dynamic lights (lights.rs + ao.rs): 0 = off, 1 = on; strength of the added
@@ -49,6 +52,9 @@ pub struct Config {
     pub lights_party: f32,
     /// Contrast-adaptive sharpening of the 3D image, 0 = off .. 1 = strongest (ao.rs).
     pub sharpen: f32,
+    /// Bloom intensity (0 = off) and the brightness (brightest channel, 0..1) where it starts.
+    pub bloom: f32,
+    pub bloom_threshold: f32,
     /// Temporary: virtual-key code that toggles AO + per-pixel lights in-game (0 = none; Insert,
     /// which the game leaves unbound; F9 is its quick save).
     pub toggle_key: u32,
@@ -58,8 +64,8 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             filter: 16, hq_formats: true, max_detail: true, soft_shadows: true, msaa: 0,
-            ao: 0, ao_radius: 1.0, ao_strength: 1.3, ao_fade_start: 25.0, ao_fade_end: 40.0, ao_debug: false, lights_probe: 0,
-            lights: 0, lights_strength: 0.3, lights_debug: false, lights_party: 0.4, sharpen: 0.0, toggle_key: 0x2D,
+            ao: 0, ao_radius: 1.0, ao_strength: 1.3, ao_fade_start: 25.0, ao_fade_end: 40.0, ao_debug: false, ao_bleed: 0.0, lights_probe: 0,
+            lights: 0, lights_strength: 0.3, lights_debug: false, lights_party: 0.4, sharpen: 0.0, bloom: 0.0, bloom_threshold: 0.7, toggle_key: 0x2D,
         }
     }
 }
@@ -83,12 +89,15 @@ impl Config {
                 "ao_fade_start" => self.ao_fade_start = v.parse().unwrap_or(self.ao_fade_start),
                 "ao_fade_end" => self.ao_fade_end = v.parse().unwrap_or(self.ao_fade_end),
                 "ao_debug" => self.ao_debug = flag,
+                "ao_bleed" => self.ao_bleed = v.parse::<f32>().unwrap_or(self.ao_bleed).clamp(0.0, 1.0),
                 "lights_probe" => self.lights_probe = v.parse().unwrap_or(0),
                 "lights" => self.lights = v.parse().unwrap_or(self.lights).min(1),
                 "lights_strength" => self.lights_strength = v.parse().unwrap_or(self.lights_strength),
                 "lights_debug" => self.lights_debug = flag,
                 "lights_party" => self.lights_party = v.parse().unwrap_or(self.lights_party),
                 "sharpen" => self.sharpen = v.parse::<f32>().unwrap_or(self.sharpen).clamp(0.0, 1.0),
+                "bloom" => self.bloom = v.parse::<f32>().unwrap_or(self.bloom).clamp(0.0, 2.0),
+                "bloom_threshold" => self.bloom_threshold = v.parse::<f32>().unwrap_or(self.bloom_threshold).clamp(0.0, 0.99),
                 "toggle_key" => self.toggle_key = v.strip_prefix("0x").map_or_else(|| v.parse().ok(), |h| u32::from_str_radix(h, 16).ok()).unwrap_or(self.toggle_key),
                 _ => {}
             }

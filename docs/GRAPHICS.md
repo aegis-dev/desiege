@@ -15,7 +15,8 @@ here: render the original art better, don't replace it, and keep every effect sw
 | MSAA via dxwrapper | launcher | needs `DdrawAllowMultiSampling`; costly on iGPUs |
 | Ambient occlusion (experimental) | `d3d9.rs`, `ao.rs` | ~1.5-2 ms on a Radeon 680M; off with MSAA |
 | Per-pixel dynamic lights (experimental) | `lights.rs`, `ao.rs` | see #1 below |
-| Contrast-adaptive sharpening | `ao.rs` pass 4 | ~2 ms (mostly the copy); tap distance scales with resolution; works with MSAA |
+| Contrast-adaptive sharpening | `ao.rs` pass 5 | ~2 ms (mostly the copy); tap distance scales with resolution; works with MSAA |
+| Bloom | `ao.rs` passes 4 + 6 | ~0.7 ms; shares the sharpening copy |
 
 The AO work gave us the building blocks for everything below: the real Direct3D 9 device under
 dxwrapper, readable depth (INTZ), a pass inserted between the 3D world and the UI, state-block
@@ -62,18 +63,28 @@ Open:
 - [ ] Testing notes: moving the mouse in a scripted run swings the camera to top-down; leave
       the cursor where it clicked *Continue* for reproducible views.
 
-### 2. Bloom / glow on light sources
+### 2. Bloom / glow on light sources - done
 
-A soft halo around bright pixels (fire, glowing spells, sunlit water), from the final image only:
-no engine knowledge needed. Low risk, easy to overdo: keep it subtle and switchable. Needs a
-copy of the back buffer and a downsampled blur chain.
+Launcher: Bloom Off/Subtle/Medium/Strong. From the copy of the 3D image (shared with
+sharpening): bright pass at quarter size (soft threshold 0.7 on the brightest channel, weighted
+by saturation so a white shirt in the party light doesn't glow like a flame), three 9-tap
+Gaussian rounds with growing spacing, and two scales added back (the round-1 result as a tight
+halo, the final one as the wide glow): with only the wide one, a small flame's energy spread so
+thin that it didn't show. Screenshot: `docs/screenshots/9-bloom.jpg`.
+Open: spells and night scenes untested; could also take the per-pixel light term as a source.
 
-### 3. AO with colour bleeding
+### 3. AO with colour bleeding - done, off by default
 
-Extend the AO pass to pick up nearby colour (a green bush tints the ground below it). Needs one
-copy of the back buffer per frame. Small step from the current AO.
+`DESIEGE_GFX=ao_bleed=0.6` (0..1). The AO pass also averages the colour of each pixel's
+occluders (from a copy of the image before AO) and the composite shifts the shadow's hue towards
+it at the same darkness: the ground under the wooden door goes warm brown, grass casts green.
+Works, but subtle in this art style for its cost (~2 ms here, mostly the extra copy), so it's a
+tuning key rather than a launcher option. Could be cheaper by reading colour at half size.
 
 ### 4. Per-pixel distance / height fog
+
+*Waiting for a test save in a foggy area (valley, swamp, mountain pass): the farm at the start
+has no visible fog to compare against.*
 
 The game's fog is per vertex and bands. Depth-based fog per pixel, with the game's own fog colour
 and distances (`MoodSetting::GetfogColor`, `GetfogNearDist`, `GetfogFarDist` are exported), would
