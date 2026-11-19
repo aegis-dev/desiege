@@ -438,7 +438,7 @@ fn enable_flip(gas: &str) -> String {
 fn patched_gas(original: &str) -> Option<CString> {
     let text = fs::read_to_string(original).ok()?;
     let with_res = launch_resolution().and_then(|(w, h)| add_resolution(&text, w, h)).unwrap_or_else(|| text.clone());
-    let patched = enable_flip(&with_res);
+    let patched = gfx::patch_gas(&enable_flip(&with_res), gfx::config());
     if patched == text {
         return None;
     }
@@ -568,6 +568,9 @@ unsafe extern "system" fn dd_create_surface(this: P, desc: *mut c_void, out: *mu
     let hr = call!(DD_CREATE_SURFACE as fn(P, *mut c_void, *mut P, P) -> HRESULT; this, desc, out, outer);
     if main && hr >= 0 {
         scale::created_main_surface(*out);
+    }
+    if hr >= 0 && !desc.is_null() {
+        gfx::note_surface(desc);
     }
     // Textures get created by the thousand; log every failure but only the first 40 successes.
     if hr < 0 || SURFACES_LOGGED.fetch_add(1, Relaxed) < 40 {
@@ -705,22 +708,33 @@ unsafe extern "system" fn d3d_create_device(this: P, clsid: *const Guid, surf: P
     log!("IDirect3D7::CreateDevice({}) -> {}", G(clsid), Hr(hr));
     if hr >= 0 {
         scale::created_device(*out, surf);
+        gfx::hook_device(*out);
     }
     hr
 }
 
 type ZCb = unsafe extern "system" fn(*mut c_void, P) -> HRESULT;
-unsafe extern "system" fn z_cb(pf: *mut c_void, ctx: P) -> HRESULT {
-    let c = &*(ctx as *const EnumCtx<ZCb>);
-    // DDPIXELFORMAT: dwFlags@4 dwZBufferBitDepth@12
-    log!("  zbuffer flags=0x{:X} bits={}", rd(pf, 4), rd(pf, 12));
-    (c.cb)(pf, c.ctx)
+unsafe extern "system" fn z_collect(pf: *mut c_void, ctx: P) -> HRESULT {
+    let mut f = [0u8; 32];
+    std::ptr::copy_nonoverlapping(pf as *const u8, f.as_mut_ptr(), 32);
+    (*(ctx as *mut Vec<[u8; 32]>)).push(f);
+    1 // D3DENUMRET_OK
 }
 
+/// Collects the formats first so 16-bit depth can be hidden when a deeper one exists (gfx).
 unsafe extern "system" fn d3d_enum_zbuf(this: P, dev: *const Guid, cb: ZCb, ctx: P) -> HRESULT {
     log!("IDirect3D7::EnumZBufferFormats({})", G(dev));
-    let mut c = EnumCtx { cb, ctx };
-    let hr = call!(D3D_ENUM_ZBUF as fn(P, *const Guid, ZCb, P) -> HRESULT; this, dev, z_cb, &mut c as *mut _ as P);
+    let mut all: Vec<[u8; 32]> = Vec::new();
+    let hr = call!(D3D_ENUM_ZBUF as fn(P, *const Guid, ZCb, P) -> HRESULT; this, dev, z_collect, &mut all as *mut _ as P);
+    // DDPIXELFORMAT: dwFlags@4 dwZBufferBitDepth@12
+    let deeper = all.iter().any(|f| rd(f.as_ptr().cast(), 12) >= 24);
+    for f in &mut all {
+        let keep = gfx::keep_zbuffer(f.as_ptr().cast(), deeper);
+        log!("  zbuffer flags=0x{:X} bits={}{}", rd(f.as_ptr().cast(), 4), rd(f.as_ptr().cast(), 12), if keep { "" } else { " (hidden: hq_formats)" });
+        if keep && cb(f.as_mut_ptr().cast(), ctx) == 0 {
+            break;
+        }
+    }
     log!("IDirect3D7::EnumZBufferFormats -> {}", Hr(hr));
     hr
 }
@@ -729,6 +743,7 @@ unsafe extern "system" fn d3d_enum_zbuf(this: P, dev: *const Guid, cb: ZCb, ctx:
 mod scale;
 mod profile;
 mod code_mods;
+mod gfx;
 
 #[cfg(test)]
 mod tests {

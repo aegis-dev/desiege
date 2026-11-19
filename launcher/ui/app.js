@@ -44,6 +44,11 @@ const current = () => ({
   method: document.querySelector('input[name=method]:checked')?.value ?? 'inject',
   ui_scale: +$('scale').value,
   shadow_res: +$('shadows').value,
+  filter: +$('filter').value,
+  msaa: +$('msaa').value,
+  soft_shadows: $('soft_shadows').checked,
+  max_detail: $('max_detail').checked,
+  hq_formats: $('hq_formats').checked,
 });
 
 let saveTimer;
@@ -68,7 +73,8 @@ const DISPLAY = { exclusive: 'Fullscreen (exclusive)', borderless: 'Borderless w
 function renderSummary() {
   const s = current();
   const scale = s.ui_scale > 1 && s.fullscreen ? `${Math.round(s.ui_scale * 100)}%` : 'Off';
-  const shadows = s.shadow_res ? `${s.shadow_res} px` : 'Original method';
+  const shadows = (s.shadow_res ? `${s.shadow_res} px` : 'Original method') + (s.shadow_res && s.soft_shadows ? ', soft' : '');
+  const filter = s.filter >= 2 ? `Anisotropic ${s.filter}×` : s.filter === 1 ? 'Trilinear' : 'Original';
   const enabledMods = mods.filter((m) => m.enabled).length;
   const rows = [
     ['Game', s.game_dir || 'not found: set it in Settings', !s.game_dir],
@@ -76,6 +82,8 @@ function renderSummary() {
     ['Display', DISPLAY[$('display').value]],
     ['UI scale', scale],
     ['Shadows', shadows],
+    ['Textures', filter],
+    ['Anti-aliasing', s.msaa ? `MSAA ${s.msaa}×` : 'Off', s.msaa > 0 && !dxwInstalled],
     ['Renderer', dxwInstalled ? 'dxwrapper (Direct3D 9)' : 'Windows Direct3D 7 (max 2048 px wide)', !dxwInstalled && s.width > 2048],
     ['Mods', enabledMods ? `${enabledMods} enabled` : 'none'],
   ];
@@ -272,6 +280,11 @@ async function init() {
   $('display').value = !s.fullscreen ? 'windowed' : s.borderless ? 'borderless' : 'exclusive';
   $('scale').value = String(s.ui_scale);
   $('shadows').value = String(s.shadow_res);
+  $('filter').value = String(s.filter);
+  $('msaa').value = String(s.msaa);
+  $('soft_shadows').checked = s.soft_shadows;
+  $('max_detail').checked = s.max_detail;
+  $('hq_formats').checked = s.hq_formats;
   document.querySelector(`input[name=method][value=${s.method}]`).checked = true;
   declined = s.dxwrapper_declined;
   dxwInstalled = await invoke('dxwrapper_installed');

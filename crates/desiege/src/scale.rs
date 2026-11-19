@@ -1692,7 +1692,8 @@ pub mod shadow {
         }
         let dev = DEVICE.load(Relaxed) as P;
         with(|s| {
-            let (target, _) = s.capturing?;
+            let (captured, back) = s.capturing?;
+            let target = if crate::gfx::config().soft_shadows { soften(dev, s, captured, back as P) } else { captured };
             end_capture(dev, s);
             match s.map.iter_mut().find(|m| m.0 == tex as usize) {
                 Some(m) => {
@@ -1706,6 +1707,87 @@ pub mod shadow {
             Some(0)
         })
         .flatten()
+    }
+
+    /// Blur radius as a fraction of the shadow texture size, so softness looks the same at
+    /// every shadow quality (0.7 % of 256 px = 1.8 px). The texture is stretched over a large patch
+    /// of ground, so a little goes a long way; 1.2 % already washed thin limbs out.
+    const SOFT_RADIUS: f32 = 0.007;
+    const SOFT_TAPS: usize = 12;
+
+    /// Tap offsets (in units of the radius): a golden-angle spiral, evenly covering the disc.
+    pub fn soft_taps() -> [(f32, f32); SOFT_TAPS] {
+        let mut t = [(0.0, 0.0); SOFT_TAPS];
+        for (i, p) in t.iter_mut().enumerate() {
+            let r = ((i as f32 + 0.5) / SOFT_TAPS as f32).sqrt();
+            let a = i as f32 * 2.399_963; // golden angle
+            *p = (r * a.cos(), r * a.sin());
+        }
+        t
+    }
+
+    /// Soft shadows: average SOFT_TAPS offset copies of the captured silhouette into a second
+    /// render target (running average: tap i is blended in with weight 1/(i+1), which keeps
+    /// 8-bit rounding error to a level or two). Returns the texture to use; the capture goes
+    /// back to the pool. Falls back to the sharp capture if anything fails.
+    unsafe fn soften(dev: P, s: &mut State, src: usize, back: P) -> usize {
+        let Some(dst) = s.free.pop().or_else(|| create_target(back)) else { return src };
+        if call!(DEV_SET_RT as fn(P, P, u32) -> HRESULT; dev, dst as P, 0) < 0 {
+            s.free.push(dst);
+            return src;
+        }
+        let r = res() as f32;
+        let vp = Viewport { x: 0, y: 0, w: res(), h: res(), min_z: 0.0, max_z: 1.0 };
+        call!(DEV_SET_VP as fn(P, *const Viewport) -> HRESULT; dev, &vp);
+        let get_rs: unsafe extern "system" fn(P, u32, *mut u32) -> HRESULT = method(dev, 21);
+        let set_rs: unsafe extern "system" fn(P, u32, u32) -> HRESULT = method(dev, 20);
+        let get_ts: unsafe extern "system" fn(P, u32, u32, *mut u32) -> HRESULT = method(dev, 36);
+        let set_ts: unsafe extern "system" fn(P, u32, u32, u32) -> HRESULT = method(dev, 37);
+        let get_tex: unsafe extern "system" fn(P, u32, *mut P) -> HRESULT = method(dev, 34);
+        let begin: unsafe extern "system" fn(P) -> HRESULT = method(dev, 5);
+        // ZENABLE, ZWRITE, ALPHABLEND, SRCBLEND=SRCALPHA, DESTBLEND=INVSRCALPHA, ALPHATEST,
+        // CULL=NONE, FOG, SPECULAR, COLORKEY, STENCIL
+        let rs: [(u32, u32); 11] = [(7, 0), (14, 0), (27, 1), (19, 5), (20, 6), (15, 0), (22, 1), (28, 0), (29, 0), (41, 0), (52, 0)];
+        // stage 0: colour = texture, alpha = vertex diffuse (the tap weight), clamp, bilinear,
+        // no mips, coord set 0; stage 1 off
+        let ts: [(u32, u32, u32); 12] =
+            [(0, 1, 2), (0, 2, 2), (0, 4, 2), (0, 5, 0), (0, 12, 3), (0, 16, 2), (0, 17, 2), (0, 18, 1), (0, 11, 0), (0, 24, 0), (1, 1, 1), (1, 4, 1)];
+        let saved_rs: Vec<(u32, u32)> = rs.iter().filter_map(|&(k, _)| { let mut v = 0; (get_rs(dev, k, &mut v) >= 0).then_some((k, v)) }).collect();
+        let saved_ts: Vec<(u32, u32, u32)> = ts.iter().filter_map(|&(st, k, _)| { let mut v = 0; (get_ts(dev, st, k, &mut v) >= 0).then_some((st, k, v)) }).collect();
+        let mut old_tex = std::ptr::null_mut();
+        get_tex(dev, 0, &mut old_tex);
+        for &(k, v) in &rs { set_rs(dev, k, v); }
+        for &(st, k, v) in &ts { set_ts(dev, st, k, v); }
+        call!(DEV_SET_TEX as fn(P, u32, P) -> HRESULT; dev, 0, src as P);
+        // The game is normally mid-scene here; if not, open one for our draws.
+        let own_scene = begin(dev) >= 0;
+        let radius = (r * SOFT_RADIUS).max(1.0);
+        for (i, (dx, dy)) in soft_taps().iter().enumerate() {
+            let alpha = (255.0 / (i as f32 + 1.0)).round() as u32;
+            let c = (alpha << 24) | 0x00FF_FFFF;
+            let (u0, v0) = (dx * radius / r, dy * radius / r);
+            let (x0, y0, x1, y1) = (-0.5f32, -0.5f32, r - 0.5, r - 0.5);
+            let c = f32::from_bits(c);
+            // XYZRHW | DIFFUSE | TEX1
+            let quad: [f32; 28] = [
+                x0, y0, 0.0, 1.0, c, u0, v0,
+                x1, y0, 0.0, 1.0, c, 1.0 + u0, v0,
+                x0, y1, 0.0, 1.0, c, u0, 1.0 + v0,
+                x1, y1, 0.0, 1.0, c, 1.0 + u0, 1.0 + v0,
+            ];
+            call!(DEV_DP as fn(P, u32, u32, *const c_void, u32, u32) -> HRESULT; dev, 5, 0x144, quad.as_ptr().cast(), 4, 0);
+        }
+        if own_scene {
+            call!(DEV_END_SCENE as fn(P) -> HRESULT; dev);
+        }
+        call!(DEV_SET_TEX as fn(P, u32, P) -> HRESULT; dev, 0, old_tex);
+        if !old_tex.is_null() {
+            release(old_tex as usize); // GetTexture's reference
+        }
+        for (k, v) in saved_rs { set_rs(dev, k, v); }
+        for (st, k, v) in saved_ts { set_ts(dev, st, k, v); }
+        s.free.push(src);
+        dst
     }
 
     /// Debug: DESIEGE_DUMP_SHADOWS=1 writes the first few captured shadows to
@@ -1934,6 +2016,14 @@ mod tests {
         assert_eq!(cursor::reconstruct(&[0xFF10_1010], &[0xFF00_0000]), None); // not a pair
         // channels disagree on the background step: different cursor content in the two frames
         assert_eq!(cursor::reconstruct(&[0xFF00_0000], &[0xFFFF_0000]), None);
+    }
+
+    #[test]
+    fn soft_shadow_taps_cover_the_disc() {
+        let t = shadow::soft_taps();
+        assert!(t.iter().all(|&(x, y)| (x * x + y * y).sqrt() <= 1.0 + 1e-4));
+        let (mx, my) = t.iter().fold((0.0, 0.0), |a, &(x, y)| (a.0 + x, a.1 + y));
+        assert!((mx / t.len() as f32).abs() < 0.1 && (my / t.len() as f32).abs() < 0.1, "centred: {mx} {my}");
     }
 
     #[test]

@@ -25,8 +25,9 @@ const DXWRAPPER_LINKS: [&str; 3] = [
     "https://github.com/elishacloud/dxwrapper/blob/master/License.txt",
 ];
 /// dxwrapper.ini, rewritten on every launch (the display mode can change between launches).
-fn dxwrapper_ini(borderless: bool) -> String {
-    format!(
+/// `msaa` = sample count, 0 = off.
+fn dxwrapper_ini(borderless: bool, msaa: u32) -> String {
+    let mut ini = format!(
         "; Written by the Desiege launcher on every launch; edits are overwritten.
 [General]
 ; The game decompresses its archives on demand by catching access violations (thousands while
@@ -46,7 +47,18 @@ DdrawHookSystem32 = 1
 FullscreenWindowMode = {}
 ",
         borderless as u8
-    )
+    );
+    if msaa > 0 {
+        // Without DdrawAllowMultiSampling dxwrapper renders single-sampled and copies through a
+        // multisampled surface, which softens every texture (measured: -15% texture detail).
+        ini.push_str(&format!("; Multisample anti-aliasing (launcher setting)
+AntiAliasing = {msaa}
+
+[Dd7to9]
+DdrawAllowMultiSampling = 1
+"));
+    }
+    ini
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -69,6 +81,40 @@ struct Settings {
     /// Shadow texture size for desiege.dll's GPU shadow redirect; 0 = the game's own (slow) path.
     #[serde(default = "default_shadow_res")]
     shadow_res: u32,
+    /// Graphics enhancements, passed to desiege.dll in the `graphics` file (see its gfx.rs).
+    /// Texture filtering: 0 = the game's own, 1 = trilinear, 4/8/16 = anisotropic.
+    #[serde(default = "default_filter")]
+    filter: u32,
+    /// MSAA samples (dxwrapper), 0 = off.
+    #[serde(default)]
+    msaa: u32,
+    #[serde(default = "yes")]
+    soft_shadows: bool,
+    #[serde(default = "yes")]
+    max_detail: bool,
+    #[serde(default = "yes")]
+    hq_formats: bool,
+}
+fn default_filter() -> u32 {
+    16
+}
+const FILTER_CHOICES: [u32; 5] = [0, 1, 4, 8, 16];
+const MSAA_CHOICES: [u32; 4] = [0, 2, 4, 8];
+fn yes() -> bool {
+    true
+}
+
+/// The `graphics` file desiege.dll reads at startup (`key=value` lines).
+fn graphics_file(s: &Settings) -> String {
+    format!(
+        "filter={}
+msaa={}
+soft_shadows={}
+max_detail={}
+hq_formats={}
+",
+        s.filter, s.msaa, s.soft_shadows as u8, s.max_detail as u8, s.hq_formats as u8
+    )
 }
 fn default_shadow_res() -> u32 {
     128
@@ -259,7 +305,7 @@ async fn install_dxwrapper(app: tauri::AppHandle) -> Result<(), String> {
         return Err(format!("Download checksum mismatch (got {hash:?}); nothing was installed."));
     }
     system_tool("tar.exe", &["-xf".as_ref(), zip.as_os_str(), "-C".as_ref(), tmp.as_os_str(), "dxwrapper.dll".as_ref(), "License.txt".as_ref()])?;
-    fs::write(tmp.join("dxwrapper.ini"), dxwrapper_ini(false)).map_err(|e| e.to_string())?;
+    fs::write(tmp.join("dxwrapper.ini"), dxwrapper_ini(false, 0)).map_err(|e| e.to_string())?;
     fs::remove_file(&zip).map_err(|e| e.to_string())?;
 
     let _ = fs::remove_dir_all(&dir);
@@ -338,6 +384,11 @@ fn load_settings(app: tauri::AppHandle) -> Settings {
             borderless: false,
             ui_scale: 1.0,
             shadow_res: default_shadow_res(),
+            filter: default_filter(),
+            msaa: 0,
+            soft_shadows: true,
+            max_detail: true,
+            hq_formats: true,
         }
     })
 }
@@ -359,18 +410,24 @@ fn launch(app: tauri::AppHandle, settings: Settings) -> Result<(), String> {
     if !(1.0..=4.0).contains(&settings.ui_scale) {
         return Err("UI scale out of range".into());
     }
+    if !FILTER_CHOICES.contains(&settings.filter) || !MSAA_CHOICES.contains(&settings.msaa) {
+        return Err("Graphics setting out of range".into());
+    }
     let runtime = ensure_runtime(&app)?;
     // desiege.dll reads this (Steam launches have no launcher to pass DESIEGE_UI_SCALE).
     // Read by desiege.dll at startup (works for Steam launches too).
     fs::write(runtime.join("shadow_res"), settings.shadow_res.to_string()).map_err(|e| e.to_string())?;
+    fs::write(runtime.join("graphics"), graphics_file(&settings)).map_err(|e| e.to_string())?;
     // Display mode: dxwrapper does the borderless window; desiege.dll keeps the monitor at its
     // native mode (renders the game's smaller modes, like the 800x600 menus, centered at native).
     let borderless = settings.fullscreen && settings.borderless;
     let dxwrapper_dir = dxwrapper_dir(&app)?;
     if dxwrapper_dir.join("dxwrapper.dll").is_file() {
-        fs::write(dxwrapper_dir.join("dxwrapper.ini"), dxwrapper_ini(borderless)).map_err(|e| e.to_string())?;
+        fs::write(dxwrapper_dir.join("dxwrapper.ini"), dxwrapper_ini(borderless, settings.msaa)).map_err(|e| e.to_string())?;
     } else if borderless {
         return Err("Borderless window needs the dxwrapper renderer fix; install it or pick another display mode.".into());
+    } else if settings.msaa > 0 {
+        return Err("Anti-aliasing needs the dxwrapper renderer fix; install it or switch anti-aliasing off.".into());
     }
     let marker = runtime.join("borderless");
     if borderless {
@@ -510,7 +567,7 @@ mod tests {
 
     #[test]
     fn builds_launch_args() {
-        let mut s = Settings { game_dir: String::new(), width: 2560, height: 1440, fullscreen: true, dxwrapper_declined: false, method: Method::Inject, borderless: false, ui_scale: 1.0, shadow_res: 128 };
+        let mut s = Settings { game_dir: String::new(), width: 2560, height: 1440, fullscreen: true, dxwrapper_declined: false, method: Method::Inject, borderless: false, ui_scale: 1.0, shadow_res: 128, filter: 16, msaa: 0, soft_shadows: true, max_detail: true, hq_formats: true };
         assert_eq!(launch_args(&s), ["width=2560", "height=1440", "bpp=32", "fullscreen=true"]);
         s.ui_scale = 2.0;
         assert_eq!(launch_args(&s)[..2], ["width=1280", "height=720"]);
@@ -539,15 +596,38 @@ mod tests {
         let old: Settings = serde_json::from_str(r#"{"game_dir":"","width":1,"height":1,"fullscreen":true}"#).unwrap();
         assert_eq!(old.method, Method::Inject); // settings saved before the option existed
         assert_eq!(old.shadow_res, 128);
+        // Settings saved before the graphics options existed get the defaults.
+        assert_eq!((old.filter, old.msaa, old.soft_shadows, old.max_detail, old.hq_formats), (16, 0, true, true, true));
         assert!(!old.borderless);
     }
 
     #[test]
     fn dxwrapper_ini_switches_borderless() {
-        assert!(dxwrapper_ini(true).contains("FullscreenWindowMode = 1"));
-        assert!(dxwrapper_ini(false).contains("FullscreenWindowMode = 0"));
-        assert!(dxwrapper_ini(false).contains("DdrawHookSystem32 = 1"));
-        assert!(dxwrapper_ini(false).contains("DisableLogging = 1"));
+        assert!(dxwrapper_ini(true, 0).contains("FullscreenWindowMode = 1"));
+        assert!(dxwrapper_ini(false, 0).contains("FullscreenWindowMode = 0"));
+        assert!(dxwrapper_ini(false, 0).contains("DdrawHookSystem32 = 1"));
+        assert!(dxwrapper_ini(false, 0).contains("DisableLogging = 1"));
+        assert!(!dxwrapper_ini(false, 0).contains("AntiAliasing"));
+        let aa = dxwrapper_ini(false, 4);
+        assert!(aa.contains("AntiAliasing = 4") && aa.contains("[Dd7to9]
+DdrawAllowMultiSampling = 1"));
+    }
+
+    #[test]
+    fn writes_graphics_file() {
+        let mut s = load_defaults_for_test();
+        s.filter = 4;
+        s.soft_shadows = false;
+        assert_eq!(graphics_file(&s), "filter=4
+msaa=0
+soft_shadows=0
+max_detail=1
+hq_formats=1
+");
+    }
+
+    fn load_defaults_for_test() -> Settings {
+        serde_json::from_str(r#"{"game_dir":"","width":1920,"height":1080,"fullscreen":true}"#).unwrap()
     }
 
     #[test]

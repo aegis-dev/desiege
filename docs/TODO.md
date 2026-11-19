@@ -112,3 +112,27 @@ Running code in mods is allowed. Plan: `desiege.dll` exposes a small, versioned 
 in this repo) for hooks and callbacks; code mods are DLLs loaded by `desiege.dll`. The launcher
 must label mods that contain code (`.dll`, `.dsdll`, `.exe`) and require explicit per-mod trust
 before enabling them.
+
+## Graphics options (added 2026-11-19)
+
+Developed and measured on the GOG laptop (Radeon 680M, 2880x1620, UI 200 %, **on battery**, so
+absolute frame rates are pessimistic). Screenshots in `docs/screenshots`.
+
+- [x] Texture filtering: the game sets linear min/mag and mostly linear mips itself, but never an
+      anisotropy level. 16x AF: +23 % fine texture detail on a static grass field (Laplacian
+      variance 90 -> 111; two baseline runs 90.0 / 89.6). Trilinear alone: 92.
+- [x] Full detail: unlisted AMD GPUs get the 2002 ATI defaults (`simple_render`,
+      `no_complex_shadows`, `below_min_spec` = true). Cleared, the game draws visibly more
+      foliage. In-game about 112 fps vs 117 (borderless, 120 Hz vsync cap).
+- [x] 32-bit formats: on this AMD the game already picks A8R8G8B8 / X8R8G8B8 textures and a
+      D24S8 depth buffer, so no visible change. Matters for `only_16_bit` GPUs (Intel): **test there.**
+- [x] Soft shadows: 12-tap blur, radius 0.7 % of the shadow texture. 2.5 % and 1.2 % washed thin
+      limbs out. No measurable frame-rate cost.
+- [x] MSAA via dxwrapper works in borderless and exclusive fullscreen, shadows and cursor
+      included, and `DESIEGE_SNAPSHOT` still works. Needs `[Dd7to9] DdrawAllowMultiSampling = 1`, or
+      every texture gets softer (ground detail 17.8 -> 15.1).
+- [ ] MSAA cost: ~117 -> ~55 fps here, and **2x costs as much as 4x**, so it isn't the sample
+      count. Suspect: dxwrapper resolves and restores the multisampled back buffer on every
+      render-target switch (one per character shadow). Profile shows the time in GPU waits under
+      Flip. Next: count RT switches per frame and compare fps with shadows hidden; measure on NVIDIA.
+- [ ] All options on NVIDIA (RTX 3070 Ti, Steam) and Intel.

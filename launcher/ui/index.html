@@ -158,6 +158,29 @@
           </select>
           <span class="hint">Fullscreen or borderless. The game runs at display ÷ scale; the 3D world stays at full resolution.</span>
         </label>
+      </fieldset>
+      <fieldset>
+        <legend>Graphics</legend>
+        <span class="hint" style="margin:0 0 10px">Each option renders the original art better without replacing it. Switch any of them off to get the game's own look back.</span>
+        <label>Texture filtering
+          <select id="filter">
+            <option value="16">Anisotropic 16×</option>
+            <option value="8">Anisotropic 8×</option>
+            <option value="4">Anisotropic 4×</option>
+            <option value="1">Trilinear</option>
+            <option value="0">Original</option>
+          </select>
+          <span class="hint">Keeps ground textures sharp towards the top of the screen and far away. Practically free on any current GPU.</span>
+        </label>
+        <label>Anti-aliasing
+          <select id="msaa">
+            <option value="0">Off</option>
+            <option value="2">MSAA 2×</option>
+            <option value="4">MSAA 4×</option>
+            <option value="8">MSAA 8×</option>
+          </select>
+          <span class="hint">Smooths jagged edges on characters, trees and buildings. Costs frame rate, a lot on integrated graphics. Needs dxwrapper.</span>
+        </label>
         <label>Shadow quality
           <select id="shadows">
             <option value="64">Low (64 px)</option>
@@ -168,6 +191,9 @@
           </select>
           <span class="hint">Character shadows rendered on the GPU; higher is sharper.</span>
         </label>
+        <label><input type="checkbox" id="soft_shadows"> Soft shadow edges <span class="hint">Blurs the edges of character shadows slightly, so they no longer show stair steps.</span></label>
+        <label><input type="checkbox" id="max_detail"> Full detail on every GPU <span class="hint">Ignores the game's 2002 list of "slow" graphics cards, which puts today's AMD cards on reduced detail (fewer leaves, simpler rendering).</span></label>
+        <label><input type="checkbox" id="hq_formats"> 32-bit textures and depth <span class="hint">Never use 16-bit colour or depth, which the game's tables pick for some GPUs (Intel). Prevents colour banding and flickering surfaces far away.</span></label>
       </fieldset>
       <fieldset>
         <legend>Launch method</legend>
