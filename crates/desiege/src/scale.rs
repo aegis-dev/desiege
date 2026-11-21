@@ -330,9 +330,7 @@ pub unsafe fn emulated_lock(this: P, r: *mut RECT, desc: *mut c_void, flags: u32
     let (nw, nh) = ((nr.right - nr.left).max(1) as usize, (nr.bottom - nr.top).max(1) as usize);
     let mut buf = vec![0u32; w * h];
     let mut base = None;
-    if experiment("nocursor") {
-        // Perf experiment: hand the game a scratch buffer, never touch the real surface.
-    } else if flags & DDLOCK_WRITEONLY != 0 {
+    if flags & DDLOCK_WRITEONLY != 0 {
         if let Some((_, px)) = LAST_READ.lock().ok().and_then(|l| l.clone()).filter(|(lr, px)| same_rect(lr, &vr) && px.len() == buf.len()) {
             buf.copy_from_slice(&px);
             base = Some(px);
@@ -380,7 +378,7 @@ pub unsafe fn emulated_lock(this: P, r: *mut RECT, desc: *mut c_void, flags: u32
 pub unsafe fn emulated_unlock(this: P) -> bool {
     let pending = PENDING.lock().ok().and_then(|mut p| p.take_if(|p| p.surf == this as usize));
     let Some(p) = pending else { return false };
-    if p.write && p.w > 0 && p.h > 0 && !experiment("nocursor") {
+    if p.write && p.w > 0 && p.h > 0 {
         let t = xf();
         // With a base we skip pixels, so the native ones must survive: lock read-write.
         let mode = if p.base.is_some() { 0 } else { DDLOCK_WRITEONLY };

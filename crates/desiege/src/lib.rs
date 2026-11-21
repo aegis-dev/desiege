@@ -481,7 +481,6 @@ unsafe extern "system" fn dd_create_surface(this: P, desc: *mut c_void, out: *mu
     let mut copy = [0u8; 124];
     let main = !desc.is_null() && {
         std::ptr::copy_nonoverlapping(desc as *const u8, copy.as_mut_ptr(), 124);
-        shadow::experiment_rt_textures(copy.as_mut_ptr().cast());
         scale::adjust_create_surface(copy.as_mut_ptr().cast())
     };
     // The copy equals the game's desc unless scale adjusted it; always pass it.

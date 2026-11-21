@@ -20,18 +20,6 @@ use std::sync::{
 };
 use windows_sys::Win32::Foundation::RECT;
 
-/// DESIEGE_EXPERIMENT=rtshadow (CreateSurface, before the redirect existed): the game's own
-/// shadow textures (mipmapped, complex) become render-target textures, so dxwrapper can copy
-/// the back buffer into them on the GPU (StretchRect) instead of via the CPU.
-pub unsafe fn experiment_rt_textures(desc: *mut std::ffi::c_void) {
-    const COMPLEX: u32 = 0x8; const TEXTURE: u32 = 0x1000; const DEVICE3D: u32 = 0x2000; const MIPMAP: u32 = 0x40_0000;
-    let caps = rd(desc, 104);
-    if debug::experiment("rtshadow") && caps & TEXTURE != 0 && caps & COMPLEX != 0 && caps & MIPMAP != 0 {
-        *(desc as *mut u8).add(104).cast::<u32>() = caps | DEVICE3D;
-        log!("rtshadow: texture {}x{} caps 0x{caps:X} -> 0x{:X}", rd(desc, 12), rd(desc, 8), caps | DEVICE3D);
-    }
-}
-
 /// Shadow texture size in pixels; 0 = feature off (the game's own copy path).
 /// DESIEGE_SHADOW_RES, or a `shadow_res` file next to this DLL (launcher writes it).
 pub fn res() -> u32 {
