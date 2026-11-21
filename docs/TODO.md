@@ -18,6 +18,8 @@ driver behave, so each one needs checking on other vendors.
       (check `GetAvailableVidMem` / `GetCaps` lines in `desiege.log`).
 - [ ] UI scale 125/150/200 %: UI, text, cursor, shadows, mouse feel.
 - [ ] Cursor overlay: no white boxes or trails, including at screen edges and in the 4:3 menus.
+      (Since 2026-11-21 the image and position come from the game's cursor object on the
+      1.11.1.1486 exe, Steam and GOG; the black/white reconstruction is only a fallback.)
 - [ ] GPU shadows (all quality levels and *Original method*): shadows present and correct.
 - [ ] Dynamic vertex buffer fix: no missing or flickering geometry; compare with
       `DESIEGE_EXPERIMENT=nodynvb`.
@@ -53,8 +55,18 @@ Tested 2026-11-19 on a laptop: Windows 11, AMD Ryzen 7 7735U with Radeon 680M (i
 - [x] GOG's exe hard-codes a 60 fps cap (`mov [esi+0x90], 60.0` + NOPs at 0x416177 where the
       Steam exe reads `maxfps`). desiege.dll restores the setting: no cap unless `maxfps=` is given.
 - [x] `DungeonSiege.ini` and saves: `Documents\Dungeon Siege\`, same as Steam.
-- [ ] Compare the cursor/vertex buffer/shadow code addresses with the Steam exe byte for byte
-      (no Steam copy on the test laptop; everything worked in-game, so they likely match).
+- [x] Compared with the Steam exe byte for byte (2026-11-21, both installed on the GOG laptop;
+      Steam SHA-256 `C408EF77...`): same build (timestamp, size, no ASLR). GOG patches 19 small
+      code spots: default resolution 640x480 -> 1024x768, the 60 fps cap, a code cave at
+      0x477510 -> 0x631bd2 (the "AMD RDNA fix", touches `[SiegeEngine]+0xA8`), and a few
+      jumps (0x41653d, 0x41d576, 0x64f6bc). None overlap anything desiege.dll reads or calls:
+      the cursor object/routine, the light database calls and the globals are identical.
+- [x] Steam in-game on the same laptop (2880x1620, UI 200 %, all graphics options but MSAA):
+      AF, soft shadows, full detail, 32-bit formats, AO (INTZ), per-pixel lights
+      (`lights_probe=1`: 6 lights, party light at the screen centre), sharpening, bloom, the
+      FPS-counter code mod and the cursor object all work; 117-120 fps (vsync cap). The GOG fps
+      fix correctly leaves the Steam exe alone. Not rerun on Steam: MSAA (dxwrapper-side, no
+      exe dependence), exclusive fullscreen.
 - [x] Drop-in `ddraw.dll` method: not possible (the name is GOG's renderer); the launcher says
       so and points to Inject.
 
