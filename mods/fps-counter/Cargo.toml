@@ -1,6 +1,6 @@
 [package]
 name = "fps-counter"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Example Desiege code mod: shows the frame rate at the top of the screen"
 

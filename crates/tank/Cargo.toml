@@ -1,6 +1,6 @@
 [package]
 name = "tank"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 # Reader for Dungeon Siege Tank archives (.dsres / .dsmap), plus a small CLI:

@@ -5,9 +5,9 @@ conversation. Read this, `README.md`, `docs/TODO.md` and `tools/README.md` first
 
 ## Where we are
 
-Released: **v0.1.0** (pre-release on GitHub; CI builds a zip on every `v*` tag).
+Released: **v0.2.0** (2026-11-21; pre-release on GitHub; CI builds a zip on every `v*` tag).
 
-Committed since v0.1.0, not released yet:
+Released in v0.2.0 (after v0.1.0):
 
 - **Tabbed launcher** (Play / Settings / Mods / About), settings save on change.
 - **Local mod library** (`launcher/src/mods.rs`): drag `.dsmod`, `.dsmap`, `.dll` or `.zip` onto

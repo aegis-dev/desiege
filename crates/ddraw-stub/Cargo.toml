@@ -1,6 +1,6 @@
 [package]
 name = "ddraw-stub"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 # Tiny ddraw.dll for the game folder ("ddraw.dll in game folder" launch method).

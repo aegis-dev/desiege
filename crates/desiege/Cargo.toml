@@ -1,6 +1,6 @@
 [package]
 name = "desiege"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 # Build for the game (32-bit), or just run build.ps1:

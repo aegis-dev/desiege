@@ -501,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "ddraw-stub"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "windows-sys 0.59.0",
 ]
@@ -569,14 +569,14 @@ dependencies = [
 
 [[package]]
 name = "desiege"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "desiege-launcher"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -842,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "fps-counter"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "futures-channel"
@@ -2988,7 +2988,7 @@ dependencies = [
 
 [[package]]
 name = "tank"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "miniz_oxide 0.8.9",
 ]
