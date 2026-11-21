@@ -26,7 +26,7 @@ pub fn res() -> u32 {
     static R: OnceLock<u32> = OnceLock::new();
     let r = *R.get_or_init(|| {
         let from_file = || std::fs::read_to_string(crate::self_dir()?.join("shadow_res")).ok();
-        let r = std::env::var("DESIEGE_SHADOW_RES").ok().or_else(from_file).and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(128);
+        let r = std::env::var("DESIEGE_SHADOW_RES").ok().or_else(from_file).and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(512);
         let r = if r == 0 { 0 } else { r.clamp(32, 1024).next_power_of_two() };
         log!("shadow redirect: {}", if r == 0 { "off".to_string() } else { format!("{r}x{r}") });
         r

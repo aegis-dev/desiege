@@ -36,8 +36,8 @@ runs, and turning Desiege off gives you the untouched original back.
   64 px), with optional soft edges.
 - **Graphics options that keep the original look:** anisotropic texture filtering, MSAA,
   full detail on GPUs the game's 2002 tables call "slow" (today's AMD cards among them), and
-  32-bit colour and depth everywhere, and (experimental) screen-space ambient occlusion. Each
-  one can be switched off. Before/after screenshots:
+  32-bit colour and depth everywhere, plus screen-space ambient occlusion, per-pixel lights,
+  sharpening and bloom. Each one can be switched off. Before/after screenshots:
   [`docs/screenshots`](docs/screenshots).
 - **Correct behaviour on modern hardware:** video memory above 2 GB is reported in a way the
   game understands, so it no longer refuses to create a 3D device.
@@ -110,14 +110,18 @@ Keep these four files together.
 | **UI scale**       | Off, 125 %, 150 %, 175 %, 200 %                                             | Fullscreen and borderless only. 200 % on a 1440p screen makes the UI look like it did at 720p. |
 | **Texture filtering** | Anisotropic 16× (default), 8×, 4×, Trilinear, Original                   | Sharper ground textures at an angle and in the distance. Practically free. |
 | **Anti-aliasing**  | Off (default), MSAA 2×, 4×, 8×                                              | Smooth edges on characters, trees and buildings. Needs dxwrapper. Expensive on integrated graphics (Radeon 680M at 2880×1620: about 115 → 55 fps). |
-| **Shadow quality** | Low (64), Normal (128), High (256), Ultra (512), Original method            | Resolution of character shadows. “Original method” turns the GPU shadow redirect off (slow; for troubleshooting). |
-| **Sharpening**     | Off (default), Low, Medium, High                                            | Contrast-adaptive sharpening (after AMD FidelityFX CAS) of the 3D world, not the UI. About 2 ms per frame on a Radeon 680M at 2880×1620. Needs dxwrapper; works with anti-aliasing. |
-| **Bloom**          | Off (default), Subtle, Medium, Strong                                       | A soft glow around fire, glowing spells and other bright, saturated light; pale surfaces glow far less. About 0.7 ms. Needs dxwrapper. |
-| **Ambient occlusion** | off (default) / on — experimental                                     | Soft contact shadows in creases, under objects and inside foliage. About 2 ms per frame on a Radeon 680M at 2880×1620. Needs dxwrapper; off with anti-aliasing. |
+| **Shadow quality** | Low (64), Normal (128), High (256), Ultra (512, default), Original method   | Resolution of character shadows. “Original method” turns the GPU shadow redirect off (slow; for troubleshooting). |
+| **Sharpening**     | Off, Low, Medium, High (default)                                            | Contrast-adaptive sharpening (after AMD FidelityFX CAS) of the 3D world, not the UI. About 2 ms per frame on a Radeon 680M at 2880×1620. Needs dxwrapper; works with anti-aliasing. |
+| **Bloom**          | Off, Subtle, Medium, Strong (default)                                       | A soft glow around fire, glowing spells and other bright, saturated light; pale surfaces glow far less. About 0.7 ms. Needs dxwrapper. |
+| **Ambient occlusion** | on (default) / off                                                    | Soft contact shadows in creases, under objects and inside foliage. About 2 ms per frame on a Radeon 680M at 2880×1620. Needs dxwrapper; off with anti-aliasing. |
+| **Per-pixel lights** | on (default) / off                                                     | Torches, spells and the light around your party light the scene smoothly per pixel instead of the game's per-corner lighting. Needs dxwrapper; off with anti-aliasing. |
 | **Soft shadow edges** | on (default) / off                                                       | Blurs the shadow edges slightly (no more stair steps, most visible at 256 px and up). |
 | **Full detail on every GPU** | on (default) / off                                                | Clears the 2002 “slow card” flags (`simple_render`, `no_complex_shadows`, `below_min_spec`) in the hardware table. Unlisted AMD GPUs fall under the old ATI defaults, which set all three. |
 | **32-bit textures and depth** | on (default) / off                                               | Hides 16-bit texture and depth formats from the game and clears `only_16_bit` (set for Intel GPUs). On NVIDIA and AMD the game already picks 32-bit, so this changes nothing there. |
 | **Launch method**  | Inject (default), ddraw.dll in game folder                                  | See below. |
+
+In-game, **Insert** switches ambient occlusion and per-pixel lights off and on, to compare with
+the original look.
 
 ### Launch methods
 

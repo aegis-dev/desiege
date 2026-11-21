@@ -89,17 +89,17 @@ struct Settings {
     max_detail: bool,
     #[serde(default = "yes")]
     hq_formats: bool,
-    /// Screen-space ambient occlusion (experimental; needs dxwrapper, not with MSAA).
-    #[serde(default)]
+    /// Screen-space ambient occlusion (needs dxwrapper, not with MSAA).
+    #[serde(default = "yes")]
     ao: bool,
-    /// Per-pixel dynamic lights (experimental; needs dxwrapper, not with MSAA).
-    #[serde(default)]
+    /// Per-pixel dynamic lights (needs dxwrapper, not with MSAA).
+    #[serde(default = "yes")]
     lights: bool,
     /// Contrast-adaptive sharpening, 0 = off .. 1 (needs dxwrapper).
-    #[serde(default)]
+    #[serde(default = "default_sharpen")]
     sharpen: f32,
     /// Bloom intensity, 0 = off (needs dxwrapper).
-    #[serde(default)]
+    #[serde(default = "default_bloom")]
     bloom: f32,
 }
 fn default_filter() -> u32 {
@@ -119,7 +119,13 @@ fn graphics_file(s: &Settings) -> String {
     )
 }
 fn default_shadow_res() -> u32 {
-    128
+    512
+}
+fn default_sharpen() -> f32 {
+    0.8
+}
+fn default_bloom() -> f32 {
+    0.9
 }
 const SHADOW_RES_CHOICES: [u32; 5] = [0, 64, 128, 256, 512];
 fn one() -> f32 {
@@ -391,10 +397,10 @@ fn load_settings(app: tauri::AppHandle) -> Settings {
             soft_shadows: true,
             max_detail: true,
             hq_formats: true,
-            ao: false,
-            lights: false,
-            sharpen: 0.0,
-            bloom: 0.0,
+            ao: true,
+            lights: true,
+            sharpen: default_sharpen(),
+            bloom: default_bloom(),
         }
     })
 }
@@ -601,9 +607,10 @@ mod tests {
         assert_eq!(serde_json::to_string(&Method::GameFolder).unwrap(), "\"game_folder\"");
         let old: Settings = serde_json::from_str(r#"{"game_dir":"","width":1,"height":1,"fullscreen":true}"#).unwrap();
         assert_eq!(old.method, Method::Inject); // settings saved before the option existed
-        assert_eq!(old.shadow_res, 128);
+        assert_eq!(old.shadow_res, 512);
         // Settings saved before the graphics options existed get the defaults.
-        assert_eq!((old.filter, old.msaa, old.soft_shadows, old.max_detail, old.hq_formats, old.ao, old.lights), (16, 0, true, true, true, false, false));
+        assert_eq!((old.filter, old.msaa, old.soft_shadows, old.max_detail, old.hq_formats, old.ao, old.lights), (16, 0, true, true, true, true, true));
+        assert_eq!((old.sharpen, old.bloom), (0.8, 0.9));
         assert!(!old.borderless);
     }
 
@@ -623,7 +630,7 @@ mod tests {
         let mut s = load_defaults_for_test();
         s.filter = 4;
         s.soft_shadows = false;
-        assert_eq!(graphics_file(&s), "filter=4\nmsaa=0\nsoft_shadows=0\nmax_detail=1\nhq_formats=1\nao=0\nlights=0\nsharpen=0\nbloom=0\n");
+        assert_eq!(graphics_file(&s), "filter=4\nmsaa=0\nsoft_shadows=0\nmax_detail=1\nhq_formats=1\nao=1\nlights=1\nsharpen=0.8\nbloom=0.9\n");
     }
 
     fn load_defaults_for_test() -> Settings {

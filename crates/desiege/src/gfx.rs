@@ -64,8 +64,8 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             filter: 16, hq_formats: true, max_detail: true, soft_shadows: true, msaa: 0,
-            ao: 0, ao_radius: 1.0, ao_strength: 1.3, ao_fade_start: 25.0, ao_fade_end: 40.0, ao_debug: false, ao_bleed: 0.0, lights_probe: 0,
-            lights: 0, lights_strength: 0.3, lights_debug: false, lights_party: 0.4, sharpen: 0.0, bloom: 0.0, bloom_threshold: 0.7, toggle_key: 0x2D,
+            ao: 1, ao_radius: 1.0, ao_strength: 1.3, ao_fade_start: 25.0, ao_fade_end: 40.0, ao_debug: false, ao_bleed: 0.0, lights_probe: 0,
+            lights: 1, lights_strength: 0.3, lights_debug: false, lights_party: 0.4, sharpen: 0.8, bloom: 0.9, bloom_threshold: 0.7, toggle_key: 0x2D,
         }
     }
 }
@@ -319,9 +319,11 @@ mod tests {
     #[test]
     fn parses_ao_settings() {
         let mut c = Config::default();
-        assert_eq!(c.ao, 0); // experimental: off unless asked for
-        c.apply("ao=1,ao_radius=1.5,ao_strength=2,ao_debug=1,ao=7".split(','));
-        assert_eq!((c.ao, c.ao_radius, c.ao_strength, c.ao_debug), (1, 1.5, 2.0, true));
+        assert_eq!(c.ao, 1); // on by default
+        c.apply("ao=0,ao_radius=1.5,ao_strength=2,ao_debug=1".split(','));
+        assert_eq!((c.ao, c.ao_radius, c.ao_strength, c.ao_debug), (0, 1.5, 2.0, true));
+        c.apply("ao=7".split(','));
+        assert_eq!(c.ao, 1); // clamped
     }
 
     #[test]
